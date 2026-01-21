@@ -16,8 +16,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="models/yolov8n-pose.pt",
-        help="Model path or name (default: models/yolov8n-pose.pt).",
+        default="models/yolo26n-pose.pt",
+        help="Model path or name (default: models/yolo26n-pose.pt).",
     )
     parser.add_argument(
         "--source",
