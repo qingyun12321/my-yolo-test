@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import platform
 import time
 from pathlib import Path
 
@@ -20,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--source",
-        default="0",
+        default=None,
         help="Webcam index (e.g. 0) or device path (e.g. /dev/video0).",
     )
     parser.add_argument(
@@ -86,24 +87,56 @@ def ensure_model_path(model_path: Path) -> Path:
     return downloaded
 
 
+def is_windows() -> bool:
+    return platform.system().lower() == "windows"
+
+
+def default_source() -> str:
+    return "0"
+
+
+def backend_candidates() -> list[tuple[str, int]]:
+    if is_windows():
+        candidates = []
+        if hasattr(cv2, "CAP_DSHOW"):
+            candidates.append(("DSHOW", cv2.CAP_DSHOW))
+        if hasattr(cv2, "CAP_MSMF"):
+            candidates.append(("MSMF", cv2.CAP_MSMF))
+        candidates.append(("ANY", cv2.CAP_ANY))
+        return candidates
+    return [("ANY", cv2.CAP_ANY)]
+
+
+def open_capture(source: int | str) -> tuple[cv2.VideoCapture | None, str]:
+    last_backend = "ANY"
+    for name, backend in backend_candidates():
+        cap = cv2.VideoCapture(source, backend)
+        if cap.isOpened():
+            return cap, name
+        cap.release()
+        last_backend = name
+    return None, last_backend
+
+
 def main() -> int:
     args = parse_args()
-    source = coerce_source(args.source)
+    source_arg = args.source if args.source is not None else default_source()
+    source = coerce_source(source_arg)
     project_root = Path(__file__).resolve().parents[1]
     output_path = build_output_path(args.output)
     model_path = ensure_model_path(resolve_model_path(args.model, project_root))
 
     model = YOLO(str(model_path))
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        raise RuntimeError(f"Unable to open webcam source: {args.source}")
+    cap, backend_name = open_capture(source)
+    if not cap:
+        raise RuntimeError(f"Unable to open webcam source: {source_arg}")
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if not fps or fps != fps or fps < 1:
         fps = 30.0
 
     ok, frame = cap.read()
-    if not ok:
+    if not ok or frame is None:
         cap.release()
         raise RuntimeError("Unable to read from webcam source.")
 
@@ -134,7 +167,7 @@ def main() -> int:
                     break
 
             ok, frame = cap.read()
-            if not ok:
+            if not ok or frame is None:
                 break
     except KeyboardInterrupt:
         pass
@@ -144,7 +177,7 @@ def main() -> int:
         if show_preview:
             cv2.destroyAllWindows()
 
-    print(f"Saved output to: {output_path}")
+    print(f"Saved output to: {output_path} (backend: {backend_name})")
     return 0
 
 
