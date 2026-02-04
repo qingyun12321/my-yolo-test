@@ -10,6 +10,8 @@ from typing import Any
 BBox = tuple[float, float, float, float]
 # Keypoints: [(x, y, conf), ...]，conf 范围 [0.0, 1.0]
 Keypoints = list[tuple[float, float, float]]
+# HandKeypoints: 21 个手部关键点列表（wrist + 4*5 指节）
+HandKeypoints = list[tuple[float, float, float]]
 
 
 @dataclass(frozen=True)

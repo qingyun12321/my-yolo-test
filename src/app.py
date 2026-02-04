@@ -27,11 +27,13 @@ from .config import (
     timestamp,
 )
 from .contact.hand_object import detect_contact
+from .features.hand_skeleton import HAND_EDGES
 from .features.skeleton import normalize_keypoints
 from .io.capture import open_capture
 from .io.output import JsonlEmitter
 from .types import ActionResult, ContactResult, TrackedPerson
 from .vision.detect import infer_objects, load_det_model
+from .vision.hand import infer_hand_on_crop, load_hand_model
 from .vision.pose import infer_pose, load_pose_model
 from .vision.track import SimpleTracker
 
@@ -56,6 +58,11 @@ def parse_args() -> argparse.Namespace:
         help="Detection/seg model path or name (default: models/yolo26n-seg.pt).",
     )
     parser.add_argument(
+        "--hand-model",
+        default="models/hand-keypoints.pt",
+        help="Hand keypoints model path or name (default: models/hand-keypoints.pt).",
+    )
+    parser.add_argument(
         "--source",
         default=None,
         help="Webcam index (e.g. 0) or device path (e.g. /dev/video0).",
@@ -73,9 +80,27 @@ def parse_args() -> argparse.Namespace:
         help="Inference image size.",
     )
     parser.add_argument(
+        "--hand-imgsz",
+        type=int,
+        default=640,
+        help="Hand model inference size (positive int).",
+    )
+    parser.add_argument(
         "--device",
         default=None,
         help="Device to run on (e.g. 0, 0,1, or cpu).",
+    )
+    parser.add_argument(
+        "--hand-conf",
+        type=float,
+        default=0.25,
+        help="Hand keypoints confidence threshold (0-1).",
+    )
+    parser.add_argument(
+        "--hand-scale",
+        type=float,
+        default=0.35,
+        help="Hand crop size ratio vs person bbox height (0.1-1.0).",
     )
     parser.add_argument(
         "--fps",
@@ -131,9 +156,11 @@ def main() -> int:
 
     pose_model_arg = prepare_model_arg(args.pose_model)
     det_model_arg = prepare_model_arg(args.det_model)
+    hand_model_arg = prepare_model_arg(args.hand_model)
 
     pose_model = load_pose_model(pose_model_arg)
     det_model = load_det_model(det_model_arg)
+    hand_model = load_hand_model(hand_model_arg)
 
     cap, backend_name = open_capture(source)
     if not cap:
@@ -197,6 +224,7 @@ def main() -> int:
             persons = tracker.update(pose_batch.detections, now)
             actions: dict[int, ActionResult] = {}
             contacts: dict[int, ContactResult] = {}
+            hand_points: dict[int, dict[str, list[tuple[float, float, float]] | None]] = {}
 
             for person in persons:
                 # 归一化关键点，便于动作规则处理
@@ -208,6 +236,16 @@ def main() -> int:
                     det_batch.objects,
                     min_conf=args.keypoint_conf,
                     expand=args.contact_expand,
+                )
+                hand_points[person.track_id] = _infer_hands_for_person(
+                    frame,
+                    person,
+                    hand_model,
+                    conf=args.hand_conf,
+                    imgsz=args.hand_imgsz,
+                    device=args.device,
+                    crop_scale=args.hand_scale,
+                    min_wrist_conf=args.keypoint_conf,
                 )
 
             # 结果输出节流：interval <= 0 表示每帧输出
@@ -225,6 +263,7 @@ def main() -> int:
                         person,
                         actions.get(person.track_id),
                         contacts.get(person.track_id),
+                        hand_points.get(person.track_id),
                     )
                     for person in persons
                 ]
@@ -237,7 +276,14 @@ def main() -> int:
                 annotated = frame
                 if pose_batch.result is not None:
                     annotated = pose_batch.result.plot()
-                _draw_overlay(annotated, persons, actions, contacts, det_batch.objects)
+                _draw_overlay(
+                    annotated,
+                    persons,
+                    actions,
+                    contacts,
+                    det_batch.objects,
+                    hand_points,
+                )
                 cv2.imshow("Action + Contact", annotated)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
@@ -263,6 +309,7 @@ def _build_record(
     person: TrackedPerson,
     action: ActionResult | None,
     contact: ContactResult | None,
+    hands: dict[str, list[tuple[float, float, float]] | None] | None,
 ) -> dict:
     """构建输出记录（JSONL 字典）。
 
@@ -272,6 +319,7 @@ def _build_record(
         person: 追踪到的人员信息。
         action: 动作识别结果（可为 None）。
         contact: 接触检测结果（可为 None）。
+        hands: 手部关键点（左右手，可能为 None）。
 
     返回:
         dict: 结构化输出记录。
@@ -295,6 +343,7 @@ def _build_record(
             "score": None if contact.object_score is None else round(contact.object_score, 3),
             "wrist": contact.wrist_name,
         },
+        "hands": _serialize_hands(hands),
     }
 
 
@@ -304,6 +353,7 @@ def _draw_overlay(
     actions: dict[int, ActionResult],
     contacts: dict[int, ContactResult],
     objects,
+    hands: dict[int, dict[str, list[tuple[float, float, float]] | None]],
 ) -> None:
     """在画面上绘制检测框、动作与接触标记。
 
@@ -313,6 +363,7 @@ def _draw_overlay(
         actions: track_id -> 动作识别结果。
         contacts: track_id -> 接触检测结果。
         objects: 物体检测结果列表。
+        hands: track_id -> 左右手关键点。
     """
     for obj_idx, obj in enumerate(objects):
         x1, y1, x2, y2 = [int(v) for v in obj.bbox]
@@ -350,6 +401,10 @@ def _draw_overlay(
             font_scale=0.6,
             thickness=2,
         )
+        hand_data = hands.get(person.track_id)
+        if hand_data:
+            _draw_hand_keypoints(frame, hand_data.get("left"), color=(0, 128, 255))
+            _draw_hand_keypoints(frame, hand_data.get("right"), color=(0, 255, 128))
 
 
 def _draw_label(
@@ -403,6 +458,130 @@ def _draw_mask_edges(
     contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
         cv2.drawContours(frame, contours, -1, color, thickness)
+
+
+def _infer_hands_for_person(
+    frame,
+    person: TrackedPerson,
+    hand_model,
+    conf: float,
+    imgsz: int,
+    device: str | None,
+    crop_scale: float,
+    min_wrist_conf: float,
+) -> dict[str, list[tuple[float, float, float]] | None]:
+    """对单个行人推理左右手关键点（基于手腕裁剪）。
+
+    参数:
+        frame: 原始图像帧（BGR）。
+        person: 追踪到的人员对象。
+        hand_model: 已加载的手部关键点模型。
+        conf: 手部关键点置信度阈值。
+        imgsz: 手部模型推理尺寸。
+        device: 推理设备。
+        crop_scale: 裁剪尺寸相对人体 bbox 高度的比例。
+        min_wrist_conf: 手腕关键点最低置信度。
+
+    返回:
+        dict: {"left": keypoints|None, "right": keypoints|None}
+    """
+    left_wrist = _get_keypoint(person.keypoints, 9, min_wrist_conf)
+    right_wrist = _get_keypoint(person.keypoints, 10, min_wrist_conf)
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = person.bbox
+    bbox_h = max(1.0, y2 - y1)
+    crop_size = max(32, int(bbox_h * max(0.1, min(crop_scale, 1.0))))
+
+    def _crop_for(point: tuple[float, float] | None) -> tuple[int, int, int, int] | None:
+        if point is None:
+            return None
+        cx, cy = point
+        half = crop_size // 2
+        rx1 = int(max(0, min(w - 1, cx - half)))
+        ry1 = int(max(0, min(h - 1, cy - half)))
+        rx2 = int(max(0, min(w, cx + half)))
+        ry2 = int(max(0, min(h, cy + half)))
+        if rx2 - rx1 < 2 or ry2 - ry1 < 2:
+            return None
+        return (rx1, ry1, rx2, ry2)
+
+    left_crop = _crop_for(left_wrist)
+    right_crop = _crop_for(right_wrist)
+
+    left_hand = (
+        infer_hand_on_crop(hand_model, frame, left_crop, conf, imgsz, device, top_k=1)
+        if left_crop
+        else None
+    )
+    right_hand = (
+        infer_hand_on_crop(hand_model, frame, right_crop, conf, imgsz, device, top_k=1)
+        if right_crop
+        else None
+    )
+    return {
+        "left": left_hand.keypoints if left_hand else None,
+        "right": right_hand.keypoints if right_hand else None,
+    }
+
+
+def _draw_hand_keypoints(
+    frame,
+    keypoints: list[tuple[float, float, float]] | None,
+    color: tuple[int, int, int],
+    conf_threshold: float = 0.2,
+) -> None:
+    """绘制手部关键点与连线。
+
+    参数:
+        frame: OpenCV 图像帧（BGR）。
+        keypoints: 手部关键点列表（21 点）。
+        color: 绘制颜色（B, G, R）。
+        conf_threshold: 绘制阈值（0-1），小于该值不画点。
+    """
+    if not keypoints:
+        return
+    for i, j in HAND_EDGES:
+        if i >= len(keypoints) or j >= len(keypoints):
+            continue
+        x1, y1, c1 = keypoints[i]
+        x2, y2, c2 = keypoints[j]
+        if c1 >= conf_threshold and c2 >= conf_threshold:
+            cv2.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+    for x, y, conf in keypoints:
+        if conf >= conf_threshold:
+            cv2.circle(frame, (int(x), int(y)), 2, color, -1)
+
+
+def _serialize_hands(
+    hands: dict[str, list[tuple[float, float, float]] | None] | None,
+) -> dict[str, list[dict] | None] | None:
+    """将手部关键点转换为可 JSON 化的结构。"""
+    if hands is None:
+        return None
+    output: dict[str, list[dict] | None] = {}
+    for side, kps in hands.items():
+        if not kps:
+            output[side] = None
+            continue
+        output[side] = [
+            {"x": round(x, 2), "y": round(y, 2), "conf": round(conf, 3)}
+            for x, y, conf in kps
+        ]
+    return output
+
+
+def _get_keypoint(
+    keypoints: list[tuple[float, float, float]],
+    index: int,
+    min_conf: float,
+) -> tuple[float, float] | None:
+    """从关键点列表中获取指定索引点（仅返回坐标）。"""
+    if index >= len(keypoints):
+        return None
+    x, y, conf = keypoints[index]
+    if conf < min_conf:
+        return None
+    return (x, y)
 
 
 if __name__ == "__main__":

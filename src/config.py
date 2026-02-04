@@ -24,9 +24,13 @@ class AppConfig:
     字段说明：
         pose_model: 姿态模型路径或模型名，例如 "models/yolo26n-pose.pt" 或 "yolo26n-pose.pt"。
         det_model: 目标检测/分割模型路径或模型名，例如 "models/yolo26n-seg.pt" 或 "yolo26n-seg.pt"。
+        hand_model: 手部关键点模型路径（通常是训练得到的 best.pt）。
         source: 摄像头来源（字符串形式），如 "0" 或 "/dev/video0"。
         conf: 置信度阈值，范围 [0.0, 1.0]。
         imgsz: 推理输入尺寸（正整数，如 640）。
+        hand_conf: 手部关键点置信度阈值，范围 [0.0, 1.0]。
+        hand_imgsz: 手部模型推理尺寸（正整数，如 640）。
+        hand_scale: 手部裁剪尺寸占人体 bbox 高度的比例（0.1-1.0）。
         device: 推理设备，如 "cpu"、"0"、"0,1" 等，None 表示由库自动选择。
         output_interval: 输出节流间隔（秒），0 表示每帧输出。
         keypoint_conf: 关键点置信度阈值，范围 [0.0, 1.0]。
@@ -35,9 +39,13 @@ class AppConfig:
     """
     pose_model: str
     det_model: str
+    hand_model: str
     source: str
     conf: float
     imgsz: int
+    hand_conf: float
+    hand_imgsz: int
+    hand_scale: float
     device: str | None
     output_interval: float
     keypoint_conf: float
