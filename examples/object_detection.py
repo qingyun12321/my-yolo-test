@@ -69,21 +69,34 @@ def build_output_path(output_arg: str | None) -> Path:
     return output_dir / f"webcam_detect_{timestamp}.mp4"
 
 
-def resolve_model_path(model_arg: str, project_root: Path) -> Path:
+def resolve_model_arg(model_arg: str, project_root: Path) -> Path | str:
+    model_arg = model_arg.strip()
     model_path = Path(model_arg).expanduser()
-    if not model_path.is_absolute():
-        model_path = (project_root / model_path).resolve()
-    return model_path
 
-
-def ensure_model_path(model_path: Path) -> Path:
-    if model_path.exists():
+    if model_path.is_absolute():
         return model_path
 
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    downloaded = Path(attempt_download_asset(model_path))
+    if model_path.exists():
+        return model_path.resolve()
+
+    if any(sep in model_arg for sep in ("/", "\\")):
+        return (project_root / model_path).resolve()
+
+    return model_arg
+
+
+def prepare_model_arg(model_arg: str, project_root: Path) -> Path | str:
+    resolved = resolve_model_arg(model_arg, project_root)
+    if isinstance(resolved, str):
+        return resolved
+
+    if resolved.exists():
+        return resolved
+
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    downloaded = Path(attempt_download_asset(resolved, release="latest"))
     if not downloaded.exists():
-        raise FileNotFoundError(f"Model not found after download attempt: {model_path}")
+        raise FileNotFoundError(f"Model not found after download attempt: {resolved}")
     return downloaded
 
 
@@ -124,9 +137,9 @@ def main() -> int:
     source = coerce_source(source_arg)
     project_root = Path(__file__).resolve().parents[1]
     output_path = build_output_path(args.output)
-    model_path = ensure_model_path(resolve_model_path(args.model, project_root))
+    model_arg = prepare_model_arg(args.model, project_root)
 
-    model = YOLO(str(model_path))
+    model = YOLO(model_arg)
     cap, backend_name = open_capture(source)
     if not cap:
         raise RuntimeError(f"Unable to open webcam source: {source_arg}")
@@ -152,7 +165,7 @@ def main() -> int:
     try:
         while True:
             results = model.predict(
-                frame,
+                source=frame,
                 conf=args.conf,
                 imgsz=args.imgsz,
                 device=args.device,

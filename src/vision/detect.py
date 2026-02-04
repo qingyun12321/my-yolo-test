@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
@@ -15,8 +16,8 @@ class DetectionBatch:
     result: Any | None
 
 
-def load_det_model(model_path: str) -> YOLO:
-    return YOLO(model_path)
+def load_det_model(model_arg: str | Path) -> YOLO:
+    return YOLO(model_arg)
 
 
 def infer_objects(
@@ -29,7 +30,7 @@ def infer_objects(
     return_result: bool = False,
 ) -> DetectionBatch:
     results = model.predict(
-        frame,
+        source=frame,
         conf=conf,
         imgsz=imgsz,
         device=device,

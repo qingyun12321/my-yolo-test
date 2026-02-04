@@ -10,10 +10,9 @@ from .actions.rules import ActionRuleEngine
 from .config import (
     coerce_source,
     default_source,
-    ensure_model_path,
     log_dir,
+    prepare_model_arg,
     project_root,
-    resolve_model_path,
     timestamp,
 )
 from .contact.hand_object import detect_contact
@@ -103,11 +102,11 @@ def main() -> int:
     source_arg = args.source if args.source is not None else default_source()
     source = coerce_source(source_arg)
 
-    pose_model_path = ensure_model_path(resolve_model_path(args.pose_model))
-    det_model_path = ensure_model_path(resolve_model_path(args.det_model))
+    pose_model_arg = prepare_model_arg(args.pose_model)
+    det_model_arg = prepare_model_arg(args.det_model)
 
-    pose_model = load_pose_model(str(pose_model_path))
-    det_model = load_det_model(str(det_model_path))
+    pose_model = load_pose_model(pose_model_arg)
+    det_model = load_det_model(det_model_arg)
 
     cap, backend_name = open_capture(source)
     if not cap:

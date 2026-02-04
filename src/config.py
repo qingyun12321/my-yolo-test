@@ -55,19 +55,32 @@ def coerce_source(value: str) -> int | str:
     return int(value) if value.isdigit() else value
 
 
-def resolve_model_path(model_arg: str) -> Path:
+def resolve_model_arg(model_arg: str) -> Path | str:
+    model_arg = model_arg.strip()
     model_path = Path(model_arg).expanduser()
-    if not model_path.is_absolute():
-        model_path = (project_root() / model_path).resolve()
-    return model_path
 
-
-def ensure_model_path(model_path: Path) -> Path:
-    if model_path.exists():
+    if model_path.is_absolute():
         return model_path
 
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    downloaded = Path(attempt_download_asset(model_path))
+    if model_path.exists():
+        return model_path.resolve()
+
+    if any(sep in model_arg for sep in ("/", "\\")):
+        return (project_root() / model_path).resolve()
+
+    return model_arg
+
+
+def prepare_model_arg(model_arg: str) -> Path | str:
+    resolved = resolve_model_arg(model_arg)
+    if isinstance(resolved, str):
+        return resolved
+
+    if resolved.exists():
+        return resolved
+
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    downloaded = Path(attempt_download_asset(resolved, release="latest"))
     if not downloaded.exists():
         raise FileNotFoundError(
             "Model not found after download attempt. "

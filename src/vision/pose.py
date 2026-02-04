@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -15,8 +16,8 @@ class PoseBatch:
     result: Any | None
 
 
-def load_pose_model(model_path: str) -> YOLO:
-    return YOLO(model_path)
+def load_pose_model(model_arg: str | Path) -> YOLO:
+    return YOLO(model_arg)
 
 
 def infer_pose(
@@ -28,7 +29,7 @@ def infer_pose(
     return_result: bool = False,
 ) -> PoseBatch:
     results = model.predict(
-        frame,
+        source=frame,
         conf=conf,
         imgsz=imgsz,
         device=device,
