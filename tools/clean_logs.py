@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Clean log files under the output/logs directory."""
+"""清理 output/logs 下的日志文件。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import sys
 
 
 def parse_args() -> argparse.Namespace:
+    """解析命令行参数。"""
     parser = argparse.ArgumentParser(
         description="Remove files under output/logs.",
     )
@@ -21,6 +22,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """脚本主入口。
+
+    返回:
+        int: 0 表示正常完成，非 0 表示异常。
+    """
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
     log_dir = repo_root / "output" / "logs"

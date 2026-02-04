@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""基于 IoU 的轻量级单/多人追踪器。"""
+
 from dataclasses import dataclass
 
 from ..types import PoseDetection, TrackedPerson
@@ -7,6 +9,7 @@ from ..types import PoseDetection, TrackedPerson
 
 @dataclass
 class _Track:
+    """内部追踪状态（不对外暴露）。"""
     track_id: int
     bbox: tuple[float, float, float, float]
     keypoints: list[tuple[float, float, float]]
@@ -15,6 +18,15 @@ class _Track:
 
 
 def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    """计算两个 bbox 的 IoU。
+
+    参数:
+        a: 第一个 bbox (x1, y1, x2, y2)。
+        b: 第二个 bbox (x1, y1, x2, y2)。
+
+    返回:
+        float: IoU 值，范围 [0.0, 1.0]。
+    """
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     inter_x1 = max(ax1, bx1)
@@ -36,12 +48,27 @@ def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, flo
 
 class SimpleTracker:
     def __init__(self, iou_threshold: float = 0.3, max_age: float = 1.0) -> None:
+        """初始化追踪器。
+
+        参数:
+            iou_threshold: 匹配阈值，范围 [0.0, 1.0]，越大越严格。
+            max_age: 允许的最大丢失时间（秒），>0。
+        """
         self._iou_threshold = iou_threshold
         self._max_age = max_age
         self._tracks: list[_Track] = []
         self._next_id = 1
 
     def update(self, detections: list[PoseDetection], timestamp: float) -> list[TrackedPerson]:
+        """更新追踪状态并返回追踪结果。
+
+        参数:
+            detections: 当前帧的姿态检测列表。
+            timestamp: 当前时间戳（秒）。
+
+        返回:
+            list[TrackedPerson]: 更新后的追踪对象列表。
+        """
         assignments: dict[int, int] = {}
         used_tracks: set[int] = set()
 

@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+"""主应用入口：动作 + 物体接触检测。
+
+流程：
+1) 加载姿态模型与检测/分割模型
+2) 读取摄像头帧
+3) 计算姿态 + 物体
+4) 基于关键点规则识别动作
+5) 判断手与物体接触
+6) 输出结果（stdout + 可选 JSONL 文件）并可视化
+"""
+
 import argparse
 import time
 from pathlib import Path
@@ -26,6 +37,11 @@ from .vision.track import SimpleTracker
 
 
 def parse_args() -> argparse.Namespace:
+    """解析命令行参数。
+
+    返回:
+        argparse.Namespace: 解析后的参数对象。
+    """
     parser = argparse.ArgumentParser(
         description="Lightweight action + contact detection using YOLO pose and detection."
     )
@@ -70,13 +86,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--keypoint-conf",
         type=float,
-        default=0.3,
+        default=0.2,
         help="Minimum keypoint confidence for rules.",
     )
     parser.add_argument(
         "--contact-expand",
         type=int,
-        default=10,
+        default=14,
         help="Expand bbox by N pixels for contact check.",
     )
     parser.add_argument(
@@ -98,6 +114,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """主程序入口。
+
+    返回:
+        int: 0 表示正常退出，非 0 表示异常退出。
+    """
     args = parse_args()
     source_arg = args.source if args.source is not None else default_source()
     source = coerce_source(source_arg)
@@ -142,6 +163,7 @@ def main() -> int:
                 break
 
             now = time.time()
+            # 姿态推理：默认只保留置信度最高的单人结果
             pose_batch = infer_pose(
                 pose_model,
                 frame,
@@ -149,7 +171,9 @@ def main() -> int:
                 imgsz=args.imgsz,
                 device=args.device,
                 return_result=show_preview,
+                top_k=1,
             )
+            # 物体检测/分割推理
             det_batch = infer_objects(
                 det_model,
                 frame,
@@ -159,11 +183,13 @@ def main() -> int:
                 return_result=False,
             )
 
+            # 追踪单人（当前默认 top-1），用于持续的动作识别
             persons = tracker.update(pose_batch.detections, now)
             actions: dict[int, ActionResult] = {}
             contacts: dict[int, ContactResult] = {}
 
             for person in persons:
+                # 归一化关键点，便于动作规则处理
                 normalized = normalize_keypoints(person.keypoints, args.keypoint_conf)
                 action_engine.update(person.track_id, normalized, now)
                 actions[person.track_id] = action_engine.classify(person.track_id)
@@ -174,11 +200,13 @@ def main() -> int:
                     expand=args.contact_expand,
                 )
 
+            # 结果输出节流：interval <= 0 表示每帧输出
             if args.interval <= 0:
                 should_emit = True
             else:
                 should_emit = (now - last_emit) >= args.interval
 
+            # 仅当存在检测到的人时输出记录
             if should_emit and persons:
                 records = [
                     _build_record(
@@ -194,6 +222,7 @@ def main() -> int:
                     emitter.emit_many(records)
                 last_emit = now
 
+            # 可视化预览
             if show_preview:
                 annotated = frame
                 if pose_batch.result is not None:
@@ -225,6 +254,18 @@ def _build_record(
     action: ActionResult | None,
     contact: ContactResult | None,
 ) -> dict:
+    """构建输出记录（JSONL 字典）。
+
+    参数:
+        timestamp: 当前时间戳（秒）。
+        frame_index: 帧序号（从 0 开始）。
+        person: 追踪到的人员信息。
+        action: 动作识别结果（可为 None）。
+        contact: 接触检测结果（可为 None）。
+
+    返回:
+        dict: 结构化输出记录。
+    """
     action = action or ActionResult(action="none", confidence=0.0)
     contact = contact or ContactResult(
         active=False,
@@ -254,6 +295,15 @@ def _draw_overlay(
     contacts: dict[int, ContactResult],
     objects,
 ) -> None:
+    """在画面上绘制检测框、动作与接触标记。
+
+    参数:
+        frame: 当前图像帧（OpenCV BGR）。
+        persons: 追踪到的人员列表。
+        actions: track_id -> 动作识别结果。
+        contacts: track_id -> 接触检测结果。
+        objects: 物体检测结果列表。
+    """
     for obj_idx, obj in enumerate(objects):
         x1, y1, x2, y2 = [int(v) for v in obj.bbox]
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
@@ -299,6 +349,18 @@ def _draw_label(
     font_scale: float,
     thickness: int,
 ) -> None:
+    """绘制带背景色的文本标签。
+
+    参数:
+        frame: OpenCV 图像帧（BGR）。
+        text: 文本内容。
+        x: 文本左上角 X 坐标（像素）。
+        y: 文本基线 Y 坐标（像素）。
+        text_color: 字体颜色（B, G, R）。
+        bg_color: 背景色（B, G, R）。
+        font_scale: 字体缩放比例（>0）。
+        thickness: 字体线宽（>=1）。
+    """
     font = cv2.FONT_HERSHEY_SIMPLEX
     (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
     height, width = frame.shape[:2]

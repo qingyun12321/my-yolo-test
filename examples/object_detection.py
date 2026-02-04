@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""示例：YOLO 目标检测（摄像头输入，输出 mp4）。"""
+
 import argparse
 import platform
 import time
@@ -11,6 +13,7 @@ from ultralytics.utils.downloads import attempt_download_asset
 
 
 def parse_args() -> argparse.Namespace:
+    """解析命令行参数。"""
     parser = argparse.ArgumentParser(
         description="Run YOLO object detection on a webcam and save output as mp4."
     )
@@ -55,11 +58,24 @@ def parse_args() -> argparse.Namespace:
 
 
 def coerce_source(value: str) -> int | str:
+    """将来源字符串转换为 int 或保持原样。
+
+    参数:
+        value: 摄像头来源字符串（如 "0" 或 "/dev/video0"）。
+
+    返回:
+        int | str: 转换后的来源。
+    """
     value = value.strip()
     return int(value) if value.isdigit() else value
 
 
 def build_output_path(output_arg: str | None) -> Path:
+    """构建输出文件路径。
+
+    参数:
+        output_arg: 用户指定的输出路径（可为空，None 表示自动生成）。
+    """
     project_root = Path(__file__).resolve().parents[1]
     output_dir = project_root / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -70,6 +86,12 @@ def build_output_path(output_arg: str | None) -> Path:
 
 
 def resolve_model_arg(model_arg: str, project_root: Path) -> Path | str:
+    """解析模型参数为路径或模型名。
+
+    参数:
+        model_arg: 模型路径或模型名。
+        project_root: 项目根目录。
+    """
     model_arg = model_arg.strip()
     model_path = Path(model_arg).expanduser()
 
@@ -86,6 +108,12 @@ def resolve_model_arg(model_arg: str, project_root: Path) -> Path | str:
 
 
 def prepare_model_arg(model_arg: str, project_root: Path) -> Path | str:
+    """准备模型参数，必要时下载权重。
+
+    参数:
+        model_arg: 模型路径或模型名。
+        project_root: 项目根目录。
+    """
     resolved = resolve_model_arg(model_arg, project_root)
     if isinstance(resolved, str):
         return resolved
@@ -101,14 +129,17 @@ def prepare_model_arg(model_arg: str, project_root: Path) -> Path | str:
 
 
 def is_windows() -> bool:
+    """判断是否为 Windows。"""
     return platform.system().lower() == "windows"
 
 
 def default_source() -> str:
+    """默认摄像头来源（Windows 下为 '0'）。"""
     return "0"
 
 
 def backend_candidates() -> list[tuple[str, int]]:
+    """返回推荐的视频后端列表。"""
     if is_windows():
         candidates = []
         if hasattr(cv2, "CAP_DSHOW"):
@@ -121,6 +152,11 @@ def backend_candidates() -> list[tuple[str, int]]:
 
 
 def open_capture(source: int | str) -> tuple[cv2.VideoCapture | None, str]:
+    """打开摄像头或视频流。
+
+    参数:
+        source: 摄像头索引（int）或设备路径/URL（str）。
+    """
     last_backend = "ANY"
     for name, backend in backend_candidates():
         cap = cv2.VideoCapture(source, backend)
@@ -132,6 +168,11 @@ def open_capture(source: int | str) -> tuple[cv2.VideoCapture | None, str]:
 
 
 def main() -> int:
+    """示例主流程。
+
+    返回:
+        int: 0 表示正常退出。
+    """
     args = parse_args()
     source_arg = args.source if args.source is not None else default_source()
     source = coerce_source(source_arg)
@@ -164,6 +205,7 @@ def main() -> int:
 
     try:
         while True:
+            # 逐帧推理
             results = model.predict(
                 source=frame,
                 conf=args.conf,

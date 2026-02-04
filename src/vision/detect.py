@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""目标检测/分割推理与结果整理。"""
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -12,11 +14,20 @@ from ..types import DetectedObject
 
 @dataclass(frozen=True)
 class DetectionBatch:
+    """检测批次结果。"""
     objects: list[DetectedObject]
     result: Any | None
 
 
 def load_det_model(model_arg: str | Path) -> YOLO:
+    """加载检测/分割模型。
+
+    参数:
+        model_arg: 模型路径或模型名（如 "yolo26n-seg.pt"）。
+
+    返回:
+        YOLO: Ultralytics YOLO 模型实例。
+    """
     return YOLO(model_arg)
 
 
@@ -29,6 +40,20 @@ def infer_objects(
     exclude_names: Iterable[str] = ("person",),
     return_result: bool = False,
 ) -> DetectionBatch:
+    """执行目标检测/分割并整理为对象列表。
+
+    参数:
+        model: 已加载的 YOLO 模型。
+        frame: OpenCV 图像帧（BGR）。
+        conf: 置信度阈值，范围 [0.0, 1.0]。
+        imgsz: 推理输入尺寸（正整数）。
+        device: 推理设备，如 "cpu"、"0"、"0,1" 等；None 表示自动选择。
+        exclude_names: 需要过滤的类别名集合（默认过滤 "person"）。
+        return_result: 是否返回原始结果对象（用于可视化）。
+
+    返回:
+        DetectionBatch: 检测对象与可选原始结果。
+    """
     results = model.predict(
         source=frame,
         conf=conf,
