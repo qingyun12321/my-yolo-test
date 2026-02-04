@@ -182,9 +182,9 @@ def main() -> int:
     if not cap:
         raise RuntimeError(f"Unable to open webcam source: {source_arg}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not fps or fps != fps or fps < 1:
-        fps = 30.0
+    target_fps = 60.0
+    cap.set(cv2.CAP_PROP_FPS, target_fps)
+    fps = target_fps
 
     ok, frame = cap.read()
     if not ok or frame is None:

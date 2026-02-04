@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--conf",
         type=float,
-        default=0.25,
+        default=0.2,
         help="Confidence threshold for pose/detection.",
     )
     parser.add_argument(
@@ -76,6 +76,12 @@ def parse_args() -> argparse.Namespace:
         "--device",
         default=None,
         help="Device to run on (e.g. 0, 0,1, or cpu).",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=60.0,
+        help="Capture FPS target (>=1).",
     )
     parser.add_argument(
         "--interval",
@@ -92,7 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--contact-expand",
         type=int,
-        default=14,
+        default=20,
         help="Expand bbox by N pixels for contact check.",
     )
     parser.add_argument(
@@ -132,6 +138,10 @@ def main() -> int:
     cap, backend_name = open_capture(source)
     if not cap:
         raise RuntimeError(f"Unable to open webcam source: {source_arg}")
+
+    # 尝试设置摄像头采集帧率（部分设备可能会忽略该设置）
+    if args.fps and args.fps >= 1:
+        cap.set(cv2.CAP_PROP_FPS, float(args.fps))
 
     tracker = SimpleTracker(iou_threshold=0.3, max_age=1.0)
     action_engine = ActionRuleEngine(
@@ -306,7 +316,10 @@ def _draw_overlay(
     """
     for obj_idx, obj in enumerate(objects):
         x1, y1, x2, y2 = [int(v) for v in obj.bbox]
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
+        if obj.mask is not None:
+            _draw_mask_edges(frame, obj.mask, color=(0, 200, 0), thickness=2)
+        else:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
         label_y = y2 + 18 + obj_idx * 14
         _draw_label(
             frame,
@@ -370,6 +383,26 @@ def _draw_label(
     bottom_right = (x + text_w + 4, y + baseline + 2)
     cv2.rectangle(frame, top_left, bottom_right, bg_color, thickness=-1)
     cv2.putText(frame, text, (x + 2, y), font, font_scale, text_color, thickness)
+
+
+def _draw_mask_edges(
+    frame,
+    mask,
+    color: tuple[int, int, int],
+    thickness: int = 2,
+) -> None:
+    """绘制分割 mask 的边缘轮廓。
+
+    参数:
+        frame: OpenCV 图像帧（BGR）。
+        mask: 二值或概率 mask（H, W）。
+        color: 边缘颜色（B, G, R）。
+        thickness: 线宽（>=1）。
+    """
+    mask_uint8 = (mask > 0.5).astype("uint8") * 255
+    contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        cv2.drawContours(frame, contours, -1, color, thickness)
 
 
 if __name__ == "__main__":
