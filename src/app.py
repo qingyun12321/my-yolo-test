@@ -134,8 +134,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--contact-expand",
         type=int,
-        default=20,
+        default=30,
         help="Expand bbox by N pixels for contact check.",
+    )
+    parser.add_argument(
+        "--contact-dist",
+        type=float,
+        default=20.0,
+        help="Max distance (px) between keypoint and object to count as contact.",
+    )
+    parser.add_argument(
+        "--contact-min-points",
+        type=int,
+        default=1,
+        help="Minimum number of hand points required to confirm contact.",
     )
     parser.add_argument(
         "--no-preview",
@@ -258,6 +270,9 @@ def main() -> int:
                     det_batch.objects,
                     min_conf=args.keypoint_conf,
                     expand=args.contact_expand,
+                    hand_keypoints=hand_points.get(person.track_id),
+                    dist_threshold=args.contact_dist,
+                    min_points=args.contact_min_points,
                 )
                 # MediaPipe 已内置检测 + 追踪裁剪策略，直接使用全帧检测结果
                 hand_points[person.track_id] = hands_lr
