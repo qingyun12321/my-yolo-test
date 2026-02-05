@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from .actions.rules import ActionRuleEngine
 from .config import (
@@ -31,7 +32,7 @@ from .features.hand_skeleton import HAND_EDGES
 from .features.skeleton import normalize_keypoints
 from .io.capture import open_capture
 from .io.output import JsonlEmitter
-from .types import ActionResult, ContactResult, TrackedPerson
+from .types import ActionResult, ContactResult, DetectedObject, TrackedPerson
 from .vision.detect import infer_objects, load_det_model
 from .vision.hand_mediapipe import (
     create_hand_landmarker,
@@ -150,6 +151,34 @@ def parse_args() -> argparse.Namespace:
         help="Minimum number of hand points required to confirm contact.",
     )
     parser.add_argument(
+        "--hand-roi-det",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable hand ROI object detection (default: True).",
+    )
+    parser.add_argument(
+        "--hand-roi-only",
+        action="store_true",
+        help="Use ONLY hand ROI objects for contact (skip full-frame objects).",
+    )
+    parser.add_argument(
+        "--hand-roi-padding",
+        type=float,
+        default=0.35,
+        help="Hand ROI padding ratio based on hand box size (0-1).",
+    )
+    parser.add_argument(
+        "--hand-roi-min-size",
+        type=int,
+        default=96,
+        help="Minimum hand ROI size in pixels (>=32).",
+    )
+    parser.add_argument(
+        "--hand-roi-debug",
+        action="store_true",
+        help="Show hand ROI boxes in preview.",
+    )
+    parser.add_argument(
         "--no-preview",
         action="store_true",
         help="Disable preview window.",
@@ -242,40 +271,65 @@ def main() -> int:
                 top_k=1,
             )
             # 物体检测/分割推理
-            det_batch = infer_objects(
-                det_model,
-                frame,
-                conf=args.conf,
-                imgsz=args.imgsz,
-                device=args.device,
-                return_result=False,
-            )
+            det_batch = None
+            if not args.hand_roi_only:
+                det_batch = infer_objects(
+                    det_model,
+                    frame,
+                    conf=args.conf,
+                    imgsz=args.imgsz,
+                    device=args.device,
+                    return_result=False,
+                )
 
             # 追踪单人（当前默认 top-1），用于持续的动作识别
             persons = tracker.update(pose_batch.detections, now)
             actions: dict[int, ActionResult] = {}
             contacts: dict[int, ContactResult] = {}
             hand_points: dict[int, dict[str, list[tuple[float, float, float]] | None]] = {}
+            roi_objects: list[DetectedObject] = []
+            rois: list[tuple[int, int, int, int]] = []
             timestamp_ms = int(now * 1000)
             hands = detect_hands(hand_landmarker, frame, timestamp_ms)
             hands_lr = to_left_right_map(hands)
+            use_roi_det = args.hand_roi_det or args.hand_roi_only
+            if use_roi_det and hands:
+                rois = _build_hand_rois(
+                    hands_lr,
+                    frame.shape[:2],
+                    padding_ratio=args.hand_roi_padding,
+                    min_size=args.hand_roi_min_size,
+                )
+                roi_objects = _infer_objects_on_rois(
+                    det_model,
+                    frame,
+                    rois,
+                    conf=args.conf,
+                    imgsz=args.imgsz,
+                    device=args.device,
+                )
+
+            if args.hand_roi_only:
+                objects_for_contact = roi_objects
+            else:
+                objects_for_contact = (det_batch.objects if det_batch else []) + roi_objects
 
             for person in persons:
+                # MediaPipe 已内置检测 + 追踪裁剪策略，直接使用全帧检测结果
+                hand_points[person.track_id] = hands_lr
                 # 归一化关键点，便于动作规则处理
                 normalized = normalize_keypoints(person.keypoints, args.keypoint_conf)
                 action_engine.update(person.track_id, normalized, now)
                 actions[person.track_id] = action_engine.classify(person.track_id)
                 contacts[person.track_id] = detect_contact(
                     person.keypoints,
-                    det_batch.objects,
+                    objects_for_contact,
                     min_conf=args.keypoint_conf,
                     expand=args.contact_expand,
                     hand_keypoints=hand_points.get(person.track_id),
                     dist_threshold=args.contact_dist,
                     min_points=args.contact_min_points,
                 )
-                # MediaPipe 已内置检测 + 追踪裁剪策略，直接使用全帧检测结果
-                hand_points[person.track_id] = hands_lr
 
             # 结果输出节流：interval <= 0 表示每帧输出
             if args.interval <= 0:
@@ -305,12 +359,14 @@ def main() -> int:
                 annotated = frame
                 if pose_batch.result is not None:
                     annotated = pose_batch.result.plot()
+                if args.hand_roi_debug and rois:
+                    _draw_rois(annotated, rois, color=(255, 128, 0))
                 _draw_overlay(
                     annotated,
                     persons,
                     actions,
                     contacts,
-                    det_batch.objects,
+                    (det_batch.objects if det_batch else []) + roi_objects,
                     hand_points,
                 )
                 cv2.imshow("Action + Contact", annotated)
@@ -515,6 +571,125 @@ def _draw_hand_keypoints(
     for x, y, conf in keypoints:
         if conf >= conf_threshold:
             cv2.circle(frame, (int(x), int(y)), 2, color, -1)
+
+
+def _build_hand_rois(
+    hands_lr: dict[str, list[tuple[float, float, float]] | None],
+    frame_shape: tuple[int, int],
+    padding_ratio: float,
+    min_size: int,
+) -> list[tuple[int, int, int, int]]:
+    """根据手部关键点构建 ROI 列表。
+
+    参数:
+        hands_lr: {"left": kps|None, "right": kps|None}。
+        frame_shape: (H, W)。
+        padding_ratio: 基于手框尺寸的扩张比例。
+        min_size: ROI 最小像素尺寸。
+
+    返回:
+        list: ROI 列表，每项为 (x1, y1, x2, y2)。
+    """
+    h, w = frame_shape
+    rois: list[tuple[int, int, int, int]] = []
+    for side in ("left", "right"):
+        kps = hands_lr.get(side)
+        if not kps:
+            continue
+        xs = [x for x, _, _ in kps]
+        ys = [y for _, y, _ in kps]
+        x1, x2 = min(xs), max(xs)
+        y1, y2 = min(ys), max(ys)
+        box_w = max(1.0, x2 - x1)
+        box_h = max(1.0, y2 - y1)
+        pad = max(box_w, box_h) * max(0.0, min(padding_ratio, 1.0))
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        size = max(min_size, int(max(box_w, box_h) + pad * 2))
+        half = size // 2
+        rx1 = int(max(0, min(w - 1, cx - half)))
+        ry1 = int(max(0, min(h - 1, cy - half)))
+        rx2 = int(max(0, min(w, cx + half)))
+        ry2 = int(max(0, min(h, cy + half)))
+        if rx2 - rx1 >= 2 and ry2 - ry1 >= 2:
+            rois.append((rx1, ry1, rx2, ry2))
+    return rois
+
+
+def _infer_objects_on_rois(
+    det_model,
+    frame: np.ndarray,
+    rois: list[tuple[int, int, int, int]],
+    conf: float,
+    imgsz: int,
+    device: str | None,
+) -> list[DetectedObject]:
+    """在多个 ROI 上运行检测，并映射回原图坐标。
+
+    参数:
+        det_model: 已加载的检测/分割模型。
+        frame: 原始图像帧（BGR）。
+        rois: ROI 列表。
+        conf: 置信度阈值。
+        imgsz: 推理尺寸。
+        device: 推理设备。
+
+    返回:
+        list[DetectedObject]: 合并后的检测结果。
+    """
+    results: list[DetectedObject] = []
+    h, w = frame.shape[:2]
+    for roi in rois:
+        x1, y1, x2, y2 = roi
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+        batch = infer_objects(
+            det_model,
+            crop,
+            conf=conf,
+            imgsz=imgsz,
+            device=device,
+            # ROI 检测仅关注手上小物体，避免把“人/手”当作物体画出大面积 mask
+            exclude_names=("person",),
+            return_result=False,
+        )
+        for obj in batch.objects:
+            bx1, by1, bx2, by2 = obj.bbox
+            mapped_bbox = (bx1 + x1, by1 + y1, bx2 + x1, by2 + y1)
+            mapped_mask = None
+            if obj.mask is not None:
+                # 将 ROI mask 映射回全图
+                mask_full = np.zeros((h, w), dtype=obj.mask.dtype)
+                roi_h = y2 - y1
+                roi_w = x2 - x1
+                mask = obj.mask
+                # 关键修正：若 mask 尺寸与 ROI 不一致，则先 resize 到 ROI 大小
+                if mask.shape[:2] != (roi_h, roi_w):
+                    mask = cv2.resize(mask, (roi_w, roi_h), interpolation=cv2.INTER_NEAREST)
+                rx2 = min(x1 + roi_w, w)
+                ry2 = min(y1 + roi_h, h)
+                mask_full[y1:ry2, x1:rx2] = mask[: ry2 - y1, : rx2 - x1]
+                mapped_mask = mask_full
+            results.append(
+                DetectedObject(
+                    name=obj.name,
+                    bbox=mapped_bbox,
+                    score=obj.score,
+                    mask=mapped_mask,
+                )
+            )
+    return results
+
+
+def _draw_rois(
+    frame,
+    rois: list[tuple[int, int, int, int]],
+    color: tuple[int, int, int],
+) -> None:
+    """绘制 ROI 区域（调试用）。"""
+    for x1, y1, x2, y2 in rois:
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
 
 
 def _serialize_hands(
