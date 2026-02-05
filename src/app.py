@@ -93,14 +93,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hand-conf",
         type=float,
-        default=0.25,
+        default=0.1,
         help="Hand keypoints confidence threshold (0-1).",
     )
     parser.add_argument(
         "--hand-scale",
         type=float,
-        default=0.35,
+        default=0.5,
         help="Hand crop size ratio vs person bbox height (0.1-1.0).",
+    )
+    parser.add_argument(
+        "--hand-offset",
+        type=float,
+        default=0.7,
+        help="Shift crop center from wrist toward fingers using (wrist - elbow) * offset.",
+    )
+    parser.add_argument(
+        "--hand-min-size",
+        type=int,
+        default=96,
+        help="Minimum hand crop size in pixels (>=32).",
+    )
+    parser.add_argument(
+        "--hand-debug",
+        action="store_true",
+        help="Show hand crop boxes in preview.",
     )
     parser.add_argument(
         "--fps",
@@ -245,7 +262,10 @@ def main() -> int:
                     imgsz=args.hand_imgsz,
                     device=args.device,
                     crop_scale=args.hand_scale,
+                    crop_offset=args.hand_offset,
+                    min_crop_size=args.hand_min_size,
                     min_wrist_conf=args.keypoint_conf,
+                    debug_boxes=args.hand_debug,
                 )
 
             # 结果输出节流：interval <= 0 表示每帧输出
@@ -460,6 +480,18 @@ def _draw_mask_edges(
         cv2.drawContours(frame, contours, -1, color, thickness)
 
 
+def _draw_crop_box(
+    frame,
+    crop: tuple[int, int, int, int] | None,
+    color: tuple[int, int, int],
+) -> None:
+    """绘制手部裁剪框（调试用）。"""
+    if crop is None:
+        return
+    x1, y1, x2, y2 = crop
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
+
+
 def _infer_hands_for_person(
     frame,
     person: TrackedPerson,
@@ -468,7 +500,10 @@ def _infer_hands_for_person(
     imgsz: int,
     device: str | None,
     crop_scale: float,
+    crop_offset: float,
+    min_crop_size: int,
     min_wrist_conf: float,
+    debug_boxes: bool = False,
 ) -> dict[str, list[tuple[float, float, float]] | None]:
     """对单个行人推理左右手关键点（基于手腕裁剪）。
 
@@ -487,16 +522,43 @@ def _infer_hands_for_person(
     """
     left_wrist = _get_keypoint(person.keypoints, 9, min_wrist_conf)
     right_wrist = _get_keypoint(person.keypoints, 10, min_wrist_conf)
+    left_elbow = _get_keypoint(person.keypoints, 7, min_wrist_conf)
+    right_elbow = _get_keypoint(person.keypoints, 8, min_wrist_conf)
+    left_shoulder = _get_keypoint(person.keypoints, 5, min_wrist_conf)
+    right_shoulder = _get_keypoint(person.keypoints, 6, min_wrist_conf)
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = person.bbox
     bbox_h = max(1.0, y2 - y1)
-    crop_size = max(32, int(bbox_h * max(0.1, min(crop_scale, 1.0))))
+    bbox_w = max(1.0, x2 - x1)
+    scale = max(0.1, min(crop_scale, 1.0))
+    base_size = int(max(bbox_h, bbox_w) * scale)
+    crop_size = max(32, min_crop_size, base_size)
 
-    def _crop_for(point: tuple[float, float] | None) -> tuple[int, int, int, int] | None:
+    def _shifted_anchor(
+        wrist: tuple[float, float] | None,
+        elbow: tuple[float, float] | None,
+        shoulder: tuple[float, float] | None,
+    ) -> tuple[float, float] | None:
+        if wrist is None:
+            return elbow or shoulder
+        if elbow is None:
+            return wrist
+        # 将裁剪中心从手腕朝手指方向平移，提高手掌覆盖面积
+        wx, wy = wrist
+        ex, ey = elbow
+        dx = wx - ex
+        dy = wy - ey
+        return (wx + dx * crop_offset, wy + dy * crop_offset)
+
+    def _crop_for(
+        point: tuple[float, float] | None,
+        size_scale: float = 1.0,
+    ) -> tuple[int, int, int, int] | None:
         if point is None:
             return None
         cx, cy = point
-        half = crop_size // 2
+        size = max(16, int(crop_size * max(0.5, size_scale)))
+        half = size // 2
         rx1 = int(max(0, min(w - 1, cx - half)))
         ry1 = int(max(0, min(h - 1, cy - half)))
         rx2 = int(max(0, min(w, cx + half)))
@@ -505,8 +567,15 @@ def _infer_hands_for_person(
             return None
         return (rx1, ry1, rx2, ry2)
 
-    left_crop = _crop_for(left_wrist)
-    right_crop = _crop_for(right_wrist)
+    # 优先手腕，其次肘部，最后肩部作为裁剪中心（用于手腕检测不稳定时）
+    left_anchor = _shifted_anchor(left_wrist, left_elbow, left_shoulder)
+    right_anchor = _shifted_anchor(right_wrist, right_elbow, right_shoulder)
+    left_crop = _crop_for(left_anchor, size_scale=1.3 if left_wrist is None else 1.0)
+    right_crop = _crop_for(right_anchor, size_scale=1.3 if right_wrist is None else 1.0)
+
+    if debug_boxes:
+        _draw_crop_box(frame, left_crop, color=(0, 128, 255))
+        _draw_crop_box(frame, right_crop, color=(0, 255, 128))
 
     left_hand = (
         infer_hand_on_crop(hand_model, frame, left_crop, conf, imgsz, device, top_k=1)
@@ -528,7 +597,7 @@ def _draw_hand_keypoints(
     frame,
     keypoints: list[tuple[float, float, float]] | None,
     color: tuple[int, int, int],
-    conf_threshold: float = 0.2,
+    conf_threshold: float = 0.1,
 ) -> None:
     """绘制手部关键点与连线。
 
