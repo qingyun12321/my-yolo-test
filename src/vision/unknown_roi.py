@@ -20,7 +20,7 @@ from ..types import DetectedObject, HandKeypoints
 class UnknownRoiOptions:
     """ROI 未知物体回退检测参数。"""
 
-    enabled: bool = True
+    enabled: bool = False
     min_area_ratio: float = 0.012
     max_area_ratio: float = 0.55
     max_hand_dist_ratio: float = 0.58

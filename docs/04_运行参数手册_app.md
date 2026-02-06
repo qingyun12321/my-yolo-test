@@ -122,18 +122,27 @@ uv run python -m src.app --help
 | `--hand-roi-size-smooth` | `0.35` | 语法浮点；内部 clamp `[0,1]` | ROI 中心/大小平滑系数。 |
 | `--roi-object-max-area-ratio` | `0.62` | 浮点；`<=0` 关闭 | ROI 检测目标占 ROI 面积过大时过滤，聚焦小物体。 |
 | `--roi-partial-suppress` / `--no-roi-partial-suppress` | `True` | 布尔开关 | 合并前抑制 ROI 局部重复（全图已检出同一大物体）。 |
-| `--roi-partial-overlap` | `0.84` | 浮点；建议 `[0.7,0.95]` | ROI-vs-全图局部重复抑制重叠阈值（交集/小框面积）。 |
-| `--roi-partial-area-ratio` | `0.62` | 浮点；建议 `[0.3,0.9]` | ROI/全图面积比上限，越小越偏向“只保留全图大框”。 |
-| `--roi-partial-score-margin` | `0.08` | 浮点；建议 `[0,0.3]` | ROI 分数可高于全图多少仍判为局部冲突。 |
-| `--unknown-roi-fallback` / `--no-unknown-roi-fallback` | `True` | 布尔开关 | ROI 无已知类别时，启用轮廓回退并输出 `unknown` mask。 |
-| `--unknown-min-area-ratio` | `0.012` | 浮点；建议 `[0.004, 0.08]` | unknown 轮廓最小面积占 ROI 比例。 |
-| `--unknown-max-area-ratio` | `0.55` | 浮点；建议 `[0.3, 0.9]` | unknown 轮廓最大面积占 ROI 比例。 |
-| `--unknown-max-hand-dist-ratio` | `0.58` | 浮点；建议 `[0.3, 1.2]` | unknown 轮廓中心到手中心的最大距离比例。 |
-| `--unknown-max-hand-overlap-ratio` | `0.68` | 浮点；建议 `[0.3, 0.95]` | unknown 候选与手区最大重叠比例。 |
-| `--unknown-min-fill-ratio` | `0.22` | 浮点；建议 `[0.1, 0.7]` | unknown mask 在其 bbox 内的填充比例下限。 |
-| `--unknown-min-solidity` | `0.55` | 浮点；建议 `[0.3, 0.95]` | unknown mask 相对凸包的实心程度下限。 |
-| `--unknown-max-aspect-ratio` | `3.2` | 浮点；建议 `[1.5, 8]` | unknown bbox 最大长宽比，抑制细线型轮廓。 |
-| `--unknown-border-margin` | `3` | 整数；建议 `[0, 12]` | unknown 轮廓贴近 ROI 边界的剔除边距。 |
+| `--roi-partial-profile` | `balanced` | `loose` / `balanced` / `strict` | ROI 与全图结果合并前的“局部重复抑制档位”。`loose` 保留更多 ROI 小目标，`strict` 更积极抑制 ROI 局部重复。 |
+| `--unknown-roi-fallback` / `--no-unknown-roi-fallback` | `False` | 布尔开关 | ROI 无已知类别时，是否启用轮廓回退并输出 `unknown` mask（默认关闭）。 |
+| `--unknown-profile` | `balanced` | `loose` / `balanced` / `strict` | unknown 回退档位。`loose` 召回更高但误报也可能增加，`strict` 更抑制背景边缘误报。 |
+
+### 6.1 档位参数对应阈值（代码内置）
+
+`--roi-partial-profile` 对应阈值：
+
+| 档位 | overlap_threshold | area_ratio_threshold | score_margin | 调参倾向 |
+|---|---:|---:|---:|---|
+| `loose` | `0.90` | `0.48` | `0.04` | 更保留 ROI 结果，避免误杀 ROI 小目标 |
+| `balanced` | `0.84` | `0.62` | `0.08` | 默认折中 |
+| `strict` | `0.78` | `0.74` | `0.14` | 更积极丢弃 ROI 局部重复，优先全图结果 |
+
+`--unknown-profile` 对应关键阈值：
+
+| 档位 | min_area_ratio | max_area_ratio | max_hand_dist_ratio | max_hand_overlap_ratio | min_fill_ratio | min_solidity | max_aspect_ratio | border_margin | 调参倾向 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `loose` | `0.008` | `0.68` | `0.80` | `0.82` | `0.16` | `0.45` | `4.2` | `2` | 召回优先，允许更多 unknown |
+| `balanced` | `0.012` | `0.55` | `0.58` | `0.68` | `0.22` | `0.55` | `3.2` | `3` | 默认折中 |
+| `strict` | `0.018` | `0.45` | `0.48` | `0.55` | `0.30` | `0.65` | `2.6` | `5` | 误报优先，严格过滤背景轮廓 |
 
 ---
 

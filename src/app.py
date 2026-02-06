@@ -49,6 +49,55 @@ from .vision.unknown_roi import UnknownRoiOptions, infer_unknown_object_on_roi
 from .vision.pose import infer_pose, load_pose_model
 from .vision.track import SimpleTracker
 
+_ROI_PARTIAL_PROFILE_PRESETS: dict[str, tuple[float, float, float]] = {
+    # overlap_threshold, area_ratio_threshold, score_margin
+    # loose: 更保守地抑制 ROI 结果（尽量保留 ROI 小目标）
+    "loose": (0.90, 0.48, 0.04),
+    # balanced: 当前项目的默认经验参数
+    "balanced": (0.84, 0.62, 0.08),
+    # strict: 更积极地抑制 ROI 局部重复（优先信任全图结果）
+    "strict": (0.78, 0.74, 0.14),
+}
+
+_UNKNOWN_PROFILE_PRESETS: dict[str, UnknownRoiOptions] = {
+    # loose: 更容易产出 unknown，适合召回优先
+    "loose": UnknownRoiOptions(
+        enabled=True,
+        min_area_ratio=0.008,
+        max_area_ratio=0.68,
+        max_hand_dist_ratio=0.80,
+        max_hand_overlap_ratio=0.82,
+        min_fill_ratio=0.16,
+        min_solidity=0.45,
+        max_aspect_ratio=4.2,
+        border_margin=2,
+    ),
+    # balanced: 当前项目默认阈值
+    "balanced": UnknownRoiOptions(
+        enabled=True,
+        min_area_ratio=0.012,
+        max_area_ratio=0.55,
+        max_hand_dist_ratio=0.58,
+        max_hand_overlap_ratio=0.68,
+        min_fill_ratio=0.22,
+        min_solidity=0.55,
+        max_aspect_ratio=3.2,
+        border_margin=3,
+    ),
+    # strict: 更严格抑制背景轮廓误报
+    "strict": UnknownRoiOptions(
+        enabled=True,
+        min_area_ratio=0.018,
+        max_area_ratio=0.45,
+        max_hand_dist_ratio=0.48,
+        max_hand_overlap_ratio=0.55,
+        min_fill_ratio=0.30,
+        min_solidity=0.65,
+        max_aspect_ratio=2.6,
+        border_margin=5,
+    ),
+}
+
 
 def parse_args() -> argparse.Namespace:
     """解析命令行参数并返回配置对象。"""
@@ -497,79 +546,31 @@ def parse_args() -> argparse.Namespace:
         help="Suppress ROI detections that are likely partial views of full-frame objects.",
     )
     parser.add_argument(
-        "--roi-partial-overlap",
-        type=float,
-        default=0.84,
-        help="Min overlap-over-smaller-area (0-1) for ROI-vs-full partial suppression.",
-    )
-    parser.add_argument(
-        "--roi-partial-area-ratio",
-        type=float,
-        default=0.62,
-        help="Max ROI/full area ratio to consider ROI result as partial duplicate.",
-    )
-    parser.add_argument(
-        "--roi-partial-score-margin",
-        type=float,
-        default=0.08,
-        help="Allow ROI score to exceed full score by this margin before keeping ROI result.",
+        "--roi-partial-profile",
+        choices=("loose", "balanced", "strict"),
+        default="balanced",
+        help=(
+            "Profile for ROI-vs-full partial suppression: "
+            "loose(keep more ROI), balanced, strict(drop more ROI partial duplicates)."
+        ),
     )
     parser.add_argument(
         "--unknown-roi-fallback",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
             "When ROI has no known object detections, try contour-based fallback and emit "
             "'unknown' mask."
         ),
     )
     parser.add_argument(
-        "--unknown-min-area-ratio",
-        type=float,
-        default=0.012,
-        help="Minimum unknown contour area ratio in ROI (0-1).",
-    )
-    parser.add_argument(
-        "--unknown-max-area-ratio",
-        type=float,
-        default=0.55,
-        help="Maximum unknown contour area ratio in ROI (0-1).",
-    )
-    parser.add_argument(
-        "--unknown-max-hand-dist-ratio",
-        type=float,
-        default=0.58,
-        help="Max centroid distance ratio to hand center for unknown candidates.",
-    )
-    parser.add_argument(
-        "--unknown-max-hand-overlap-ratio",
-        type=float,
-        default=0.68,
-        help="Maximum overlap ratio between unknown candidate mask and hand exclude region.",
-    )
-    parser.add_argument(
-        "--unknown-min-fill-ratio",
-        type=float,
-        default=0.22,
-        help="Minimum fill ratio (mask_area/bbox_area) for unknown contour candidates.",
-    )
-    parser.add_argument(
-        "--unknown-min-solidity",
-        type=float,
-        default=0.55,
-        help="Minimum solidity (mask_area/convex_hull_area) for unknown contour candidates.",
-    )
-    parser.add_argument(
-        "--unknown-max-aspect-ratio",
-        type=float,
-        default=3.2,
-        help="Maximum aspect ratio for unknown contour bbox (rejects long thin edges).",
-    )
-    parser.add_argument(
-        "--unknown-border-margin",
-        type=int,
-        default=3,
-        help="Reject unknown contours touching ROI border within this pixel margin.",
+        "--unknown-profile",
+        choices=("loose", "balanced", "strict"),
+        default="balanced",
+        help=(
+            "Unknown fallback profile: loose(higher recall), balanced, "
+            "strict(lower false positives)."
+        ),
     )
 
     parser.add_argument(
@@ -631,6 +632,37 @@ def _merge_name_tuples(
     return tuple(merged)
 
 
+def _resolve_roi_partial_policy(profile: str) -> tuple[float, float, float]:
+    """将 ROI 局部重复抑制档位解析为具体阈值。"""
+    key = profile.strip().lower()
+    preset = _ROI_PARTIAL_PROFILE_PRESETS.get(key)
+    if preset is None:
+        preset = _ROI_PARTIAL_PROFILE_PRESETS["balanced"]
+    return preset
+
+
+def _resolve_unknown_options(enabled: bool, profile: str) -> UnknownRoiOptions:
+    """将 unknown 回退档位解析为 UnknownRoiOptions。"""
+    key = profile.strip().lower()
+    preset = _UNKNOWN_PROFILE_PRESETS.get(key)
+    if preset is None:
+        preset = _UNKNOWN_PROFILE_PRESETS["balanced"]
+    return UnknownRoiOptions(
+        enabled=bool(enabled),
+        min_area_ratio=preset.min_area_ratio,
+        max_area_ratio=preset.max_area_ratio,
+        max_hand_dist_ratio=preset.max_hand_dist_ratio,
+        hand_exclude_dilate=preset.hand_exclude_dilate,
+        max_hand_overlap_ratio=preset.max_hand_overlap_ratio,
+        min_fill_ratio=preset.min_fill_ratio,
+        min_solidity=preset.min_solidity,
+        max_aspect_ratio=preset.max_aspect_ratio,
+        border_margin=preset.border_margin,
+        min_score=preset.min_score,
+        max_score=preset.max_score,
+    )
+
+
 def main() -> int:
     """主程序入口。
 
@@ -648,17 +680,15 @@ def main() -> int:
         retina_masks=args.pred_retina_masks,
         batch=args.pred_batch,
     )
-    unknown_roi_options = UnknownRoiOptions(
+    unknown_roi_options = _resolve_unknown_options(
         enabled=bool(args.unknown_roi_fallback),
-        min_area_ratio=float(args.unknown_min_area_ratio),
-        max_area_ratio=float(args.unknown_max_area_ratio),
-        max_hand_dist_ratio=float(args.unknown_max_hand_dist_ratio),
-        max_hand_overlap_ratio=float(args.unknown_max_hand_overlap_ratio),
-        min_fill_ratio=float(args.unknown_min_fill_ratio),
-        min_solidity=float(args.unknown_min_solidity),
-        max_aspect_ratio=float(args.unknown_max_aspect_ratio),
-        border_margin=int(args.unknown_border_margin),
+        profile=str(args.unknown_profile),
     )
+    (
+        roi_partial_overlap,
+        roi_partial_area_ratio,
+        roi_partial_score_margin,
+    ) = _resolve_roi_partial_policy(str(args.roi_partial_profile))
 
     if args.det_whitelist_config:
         whitelist_path = Path(args.det_whitelist_config).expanduser()
@@ -871,9 +901,9 @@ def main() -> int:
                 roi_objects = _suppress_roi_partial_objects(
                     roi_objects=roi_objects,
                     full_objects=full_frame_objects,
-                    overlap_threshold=args.roi_partial_overlap,
-                    area_ratio_threshold=args.roi_partial_area_ratio,
-                    score_margin=args.roi_partial_score_margin,
+                    overlap_threshold=roi_partial_overlap,
+                    area_ratio_threshold=roi_partial_area_ratio,
+                    score_margin=roi_partial_score_margin,
                 )
             all_objects = roi_objects if args.hand_roi_only else (full_frame_objects + roi_objects)
             raw_object_count = len(all_objects)
