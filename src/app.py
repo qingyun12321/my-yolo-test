@@ -45,6 +45,7 @@ from .vision.hand_mediapipe import (
 )
 from .vision.hand_roi import HandRoiBuilder
 from .vision.hand_stabilizer import HandStabilizer
+from .vision.unknown_roi import UnknownRoiOptions, infer_unknown_object_on_roi
 from .vision.pose import infer_pose, load_pose_model
 from .vision.track import SimpleTracker
 
@@ -406,15 +407,21 @@ def parse_args() -> argparse.Namespace:
         help="Minimum hand ROI size as frame short-side ratio (0-1).",
     )
     parser.add_argument(
+        "--hand-roi-max-size-ratio",
+        type=float,
+        default=0.42,
+        help="Maximum hand ROI size as frame short-side ratio (0-1).",
+    )
+    parser.add_argument(
         "--hand-roi-context-scale",
         type=float,
-        default=1.9,
+        default=1.7,
         help="Scale multiplier for an additional context ROI per hand.",
     )
     parser.add_argument(
         "--hand-roi-forward-shift",
         type=float,
-        default=0.42,
+        default=0.36,
         help="Shift context ROI along hand forward direction (relative to hand ROI size).",
     )
     parser.add_argument(
@@ -473,6 +480,96 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.35,
         help="Smoothing factor for ROI center/size (0-1). Higher means more responsive.",
+    )
+    parser.add_argument(
+        "--roi-object-max-area-ratio",
+        type=float,
+        default=0.62,
+        help=(
+            "Filter ROI detections whose bbox area is too large relative to ROI area "
+            "(<=0 to disable)."
+        ),
+    )
+    parser.add_argument(
+        "--roi-partial-suppress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Suppress ROI detections that are likely partial views of full-frame objects.",
+    )
+    parser.add_argument(
+        "--roi-partial-overlap",
+        type=float,
+        default=0.84,
+        help="Min overlap-over-smaller-area (0-1) for ROI-vs-full partial suppression.",
+    )
+    parser.add_argument(
+        "--roi-partial-area-ratio",
+        type=float,
+        default=0.62,
+        help="Max ROI/full area ratio to consider ROI result as partial duplicate.",
+    )
+    parser.add_argument(
+        "--roi-partial-score-margin",
+        type=float,
+        default=0.08,
+        help="Allow ROI score to exceed full score by this margin before keeping ROI result.",
+    )
+    parser.add_argument(
+        "--unknown-roi-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When ROI has no known object detections, try contour-based fallback and emit "
+            "'unknown' mask."
+        ),
+    )
+    parser.add_argument(
+        "--unknown-min-area-ratio",
+        type=float,
+        default=0.012,
+        help="Minimum unknown contour area ratio in ROI (0-1).",
+    )
+    parser.add_argument(
+        "--unknown-max-area-ratio",
+        type=float,
+        default=0.55,
+        help="Maximum unknown contour area ratio in ROI (0-1).",
+    )
+    parser.add_argument(
+        "--unknown-max-hand-dist-ratio",
+        type=float,
+        default=0.58,
+        help="Max centroid distance ratio to hand center for unknown candidates.",
+    )
+    parser.add_argument(
+        "--unknown-max-hand-overlap-ratio",
+        type=float,
+        default=0.68,
+        help="Maximum overlap ratio between unknown candidate mask and hand exclude region.",
+    )
+    parser.add_argument(
+        "--unknown-min-fill-ratio",
+        type=float,
+        default=0.22,
+        help="Minimum fill ratio (mask_area/bbox_area) for unknown contour candidates.",
+    )
+    parser.add_argument(
+        "--unknown-min-solidity",
+        type=float,
+        default=0.55,
+        help="Minimum solidity (mask_area/convex_hull_area) for unknown contour candidates.",
+    )
+    parser.add_argument(
+        "--unknown-max-aspect-ratio",
+        type=float,
+        default=3.2,
+        help="Maximum aspect ratio for unknown contour bbox (rejects long thin edges).",
+    )
+    parser.add_argument(
+        "--unknown-border-margin",
+        type=int,
+        default=3,
+        help="Reject unknown contours touching ROI border within this pixel margin.",
     )
 
     parser.add_argument(
@@ -550,6 +647,17 @@ def main() -> int:
         half=args.pred_half,
         retina_masks=args.pred_retina_masks,
         batch=args.pred_batch,
+    )
+    unknown_roi_options = UnknownRoiOptions(
+        enabled=bool(args.unknown_roi_fallback),
+        min_area_ratio=float(args.unknown_min_area_ratio),
+        max_area_ratio=float(args.unknown_max_area_ratio),
+        max_hand_dist_ratio=float(args.unknown_max_hand_dist_ratio),
+        max_hand_overlap_ratio=float(args.unknown_max_hand_overlap_ratio),
+        min_fill_ratio=float(args.unknown_min_fill_ratio),
+        min_solidity=float(args.unknown_min_solidity),
+        max_aspect_ratio=float(args.unknown_max_aspect_ratio),
+        border_margin=int(args.unknown_border_margin),
     )
 
     if args.det_whitelist_config:
@@ -635,6 +743,7 @@ def main() -> int:
         padding_ratio=args.hand_roi_padding,
         min_size=args.hand_roi_min_size,
         min_size_ratio=args.hand_roi_min_size_ratio,
+        max_size_ratio=args.hand_roi_max_size_ratio,
         context_scale=args.hand_roi_context_scale,
         forward_shift=args.hand_roi_forward_shift,
         inward_scale=args.hand_roi_inward_scale,
@@ -747,13 +856,29 @@ def main() -> int:
                     include_names=det_include_names,
                     exclude_names=det_exclude_names,
                     predict_options=predict_options,
+                    hands_lr=hands_lr,
+                    unknown_options=unknown_roi_options,
+                    object_max_area_ratio=args.roi_object_max_area_ratio,
                 )
             stage_ms["det_roi"] = (time.time() - roi_det_t0) * 1000.0
 
             full_frame_objects = det_batch.objects if det_batch else []
+            if (
+                args.roi_partial_suppress
+                and full_frame_objects
+                and roi_objects
+            ):
+                roi_objects = _suppress_roi_partial_objects(
+                    roi_objects=roi_objects,
+                    full_objects=full_frame_objects,
+                    overlap_threshold=args.roi_partial_overlap,
+                    area_ratio_threshold=args.roi_partial_area_ratio,
+                    score_margin=args.roi_partial_score_margin,
+                )
             all_objects = roi_objects if args.hand_roi_only else (full_frame_objects + roi_objects)
             raw_object_count = len(all_objects)
             dedup_object_count = raw_object_count
+            unknown_raw_count = sum(1 for obj in all_objects if obj.name == "unknown")
 
             if args.obj_dedup:
                 all_objects = deduplicate_objects(
@@ -766,6 +891,7 @@ def main() -> int:
                     conflict_score_gap=args.obj_conflict_score_gap,
                 )
             dedup_object_count = len(all_objects)
+            unknown_dedup_count = sum(1 for obj in all_objects if obj.name == "unknown")
 
             if object_temporal is not None:
                 objects_for_contact = object_temporal.update(all_objects)
@@ -842,6 +968,7 @@ def main() -> int:
                                 f"dedup:{dedup_object_count} "
                                 f"temporal:{len(objects_for_contact)}"
                             ),
+                            f"unknown raw:{unknown_raw_count} dedup:{unknown_dedup_count}",
                             (
                                 "hands raw:"
                                 f"{len(hands)} "
@@ -1070,6 +1197,9 @@ def _infer_objects_on_rois(
     include_names: tuple[str, ...],
     exclude_names: tuple[str, ...],
     predict_options: PredictOptions,
+    hands_lr: dict[str, list[tuple[float, float, float]] | None],
+    unknown_options: UnknownRoiOptions,
+    object_max_area_ratio: float,
 ) -> list[DetectedObject]:
     """在多个 ROI 上批量执行检测，并将结果映射回原图坐标系。"""
     if not rois:
@@ -1103,10 +1233,18 @@ def _infer_objects_on_rois(
 
     results: list[DetectedObject] = []
     h, w = frame.shape[:2]
-    for roi, batch in zip(valid_rois, batches):
+    max_area_ratio = float(object_max_area_ratio)
+    for roi, crop, batch in zip(valid_rois, crops, batches):
         x1, y1, x2, y2 = roi
+        roi_area = float(max(1, (x2 - x1) * (y2 - y1)))
+        has_known_objects = False
         for obj in batch.objects:
             bx1, by1, bx2, by2 = obj.bbox
+            obj_area_ratio = _bbox_area((bx1, by1, bx2, by2)) / roi_area
+            if max_area_ratio > 0 and obj_area_ratio > max_area_ratio:
+                # ROI 目标占比过大时通常是“全图大物体局部”，交给全图检测更稳妥。
+                continue
+            has_known_objects = True
             mapped_bbox = (bx1 + x1, by1 + y1, bx2 + x1, by2 + y1)
             mapped_mask = None
             if obj.mask is not None:
@@ -1130,7 +1268,141 @@ def _infer_objects_on_rois(
                     mask=mapped_mask,
                 )
             )
+
+        # 回退策略：ROI 内未命中任何已知类别时，尝试提取 unknown 轮廓。
+        if not has_known_objects:
+            unknown_obj = infer_unknown_object_on_roi(
+                frame_shape=(h, w),
+                roi=roi,
+                crop_bgr=crop,
+                hands_lr=hands_lr,
+                options=unknown_options,
+            )
+            if unknown_obj is not None:
+                results.append(unknown_obj)
     return results
+
+
+def _suppress_roi_partial_objects(
+    roi_objects: list[DetectedObject],
+    full_objects: list[DetectedObject],
+    overlap_threshold: float,
+    area_ratio_threshold: float,
+    score_margin: float,
+) -> list[DetectedObject]:
+    """抑制 ROI 局部重复：全图已检出大物体时，丢弃 ROI 的局部片段结果。
+
+    该步骤在全图+ROI 合并前执行，专门解决：
+    1) 同一物体全图一个框、ROI 又出一个“局部框”的重复问题；
+    2) 全图类别正确、ROI 局部误分类造成的冲突问题。
+    """
+    if not roi_objects or not full_objects:
+        return roi_objects
+
+    overlap_threshold = float(max(0.0, min(overlap_threshold, 1.0)))
+    area_ratio_threshold = float(max(0.01, area_ratio_threshold))
+    score_margin = float(max(0.0, score_margin))
+
+    kept: list[DetectedObject] = []
+    for roi_obj in roi_objects:
+        drop = False
+        roi_area = _bbox_area(roi_obj.bbox)
+        if roi_area <= 1e-6:
+            continue
+
+        for full_obj in full_objects:
+            full_area = _bbox_area(full_obj.bbox)
+            if full_area <= 1e-6:
+                continue
+
+            overlap_small = _overlap_small_ratio(roi_obj.bbox, full_obj.bbox)
+            if overlap_small < overlap_threshold:
+                continue
+
+            area_ratio = roi_area / full_area
+            if area_ratio > area_ratio_threshold:
+                continue
+
+            rx, ry = _bbox_center(roi_obj.bbox)
+            if not _point_in_bbox((rx, ry), full_obj.bbox, expand=2.0):
+                continue
+
+            same_class = roi_obj.name == full_obj.name
+            roi_is_unknown = roi_obj.name == "unknown"
+            full_score_ok = full_obj.score + score_margin >= roi_obj.score
+
+            # 同类局部重复：优先保留全图结果。
+            if same_class:
+                drop = True
+                break
+
+            # unknown 局部轮廓：全图已有已知结果时优先保留全图。
+            if roi_is_unknown and full_score_ok:
+                drop = True
+                break
+
+            # 异类局部冲突：全图分数不低于 ROI 时，优先全图。
+            if full_score_ok:
+                drop = True
+                break
+
+        if not drop:
+            kept.append(roi_obj)
+
+    return kept
+
+
+def _bbox_area(bbox: tuple[float, float, float, float]) -> float:
+    """计算 bbox 面积。"""
+    x1, y1, x2, y2 = bbox
+    return float(max(0.0, x2 - x1) * max(0.0, y2 - y1))
+
+
+def _intersection_area(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> float:
+    """计算两个 bbox 的交集面积。"""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    x1 = max(ax1, bx1)
+    y1 = max(ay1, by1)
+    x2 = min(ax2, bx2)
+    y2 = min(ay2, by2)
+    return float(max(0.0, x2 - x1) * max(0.0, y2 - y1))
+
+
+def _overlap_small_ratio(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> float:
+    """交集面积占较小框面积比例。"""
+    inter = _intersection_area(a, b)
+    if inter <= 0:
+        return 0.0
+    small = min(_bbox_area(a), _bbox_area(b))
+    if small <= 1e-6:
+        return 0.0
+    return float(inter / small)
+
+
+def _bbox_center(
+    bbox: tuple[float, float, float, float],
+) -> tuple[float, float]:
+    """计算 bbox 中心。"""
+    x1, y1, x2, y2 = bbox
+    return ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
+
+
+def _point_in_bbox(
+    point: tuple[float, float],
+    bbox: tuple[float, float, float, float],
+    expand: float = 0.0,
+) -> bool:
+    """判断点是否在 bbox 内（支持边界扩展）。"""
+    x, y = point
+    x1, y1, x2, y2 = bbox
+    return (x1 - expand) <= x <= (x2 + expand) and (y1 - expand) <= y <= (y2 + expand)
 
 
 def _draw_rois(

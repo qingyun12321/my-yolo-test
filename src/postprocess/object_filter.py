@@ -152,6 +152,13 @@ def _is_duplicate_object(
     if iou >= iou_threshold:
         return True
 
+    # 局部重叠兜底：当较小框几乎被较大框包含时，通常是同物体“整体+局部”重复。
+    inter = _bbox_intersection_area(bbox_a, bbox_b)
+    if inter > 0:
+        small = min(_bbox_area(bbox_a), _bbox_area(bbox_b))
+        if small > 1e-6 and (inter / small) >= 0.88:
+            return True
+
     if center_ratio <= 0:
         return False
 

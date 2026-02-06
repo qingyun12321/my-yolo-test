@@ -32,6 +32,7 @@ class HandRoiBuilder:
         padding_ratio: float,
         min_size: int,
         min_size_ratio: float = 0.12,
+        max_size_ratio: float = 0.42,
         context_scale: float = 1.9,
         forward_shift: float = 0.42,
         inward_scale: float = 1.18,
@@ -47,6 +48,7 @@ class HandRoiBuilder:
         self.padding_ratio = float(max(0.0, min(padding_ratio, 1.0)))
         self.min_size = max(32, int(min_size))
         self.min_size_ratio = float(max(0.0, min(min_size_ratio, 1.0)))
+        self.max_size_ratio = float(max(0.1, min(max_size_ratio, 1.0)))
         self.context_scale = float(max(1.0, context_scale))
         self.forward_shift = float(max(0.0, forward_shift))
         self.inward_scale = float(max(1.0, inward_scale))
@@ -108,6 +110,7 @@ class HandRoiBuilder:
 
         if keypoints:
             dyn_min = max(self.min_size, int(round(min(h, w) * self.min_size_ratio)))
+            dyn_max = max(dyn_min + 1, int(round(min(h, w) * self.max_size_ratio)))
             center, size, direction = _estimate_hand_roi_seed(
                 keypoints,
                 padding_ratio=self.padding_ratio,
@@ -123,6 +126,9 @@ class HandRoiBuilder:
                         (1.0 - alpha) * state.center[1] + alpha * center[1],
                     )
                     size = (1.0 - alpha) * state.size + alpha * size
+
+            # 对 ROI 尺寸增加上限，避免在“手近镜头/大遮挡”场景过度放大到全图级别。
+            size = min(size, float(dyn_max))
 
             if self.direction_smooth > 0:
                 direction = _smooth_direction(

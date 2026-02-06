@@ -108,8 +108,9 @@ uv run python -m src.app --help
 | `--hand-roi-padding` | `0.35` | 语法浮点；内部 clamp `[0,1]` | 手框基础 padding。 |
 | `--hand-roi-min-size` | `96` | 整数；内部下限 `32` | ROI 像素最小边。 |
 | `--hand-roi-min-size-ratio` | `0.12` | 语法浮点；内部 clamp `[0,1]` | ROI 最小尺寸占短边比例。 |
-| `--hand-roi-context-scale` | `1.9` | 浮点；内部下限 `1.0` | 前向/横向外扩基准比例。 |
-| `--hand-roi-forward-shift` | `0.42` | 浮点；内部 `>=0` | 沿手前向的额外平移。 |
+| `--hand-roi-max-size-ratio` | `0.42` | 语法浮点；内部 clamp `[0.1,1.0]` | ROI 最大尺寸占短边比例，用于限制 ROI 过大。 |
+| `--hand-roi-context-scale` | `1.7` | 浮点；内部下限 `1.0` | 前向/横向外扩基准比例。 |
+| `--hand-roi-forward-shift` | `0.36` | 浮点；内部 `>=0` | 沿手前向的额外平移。 |
 | `--hand-roi-inward-scale` | `1.18` | 浮点；内部下限 `1.0` | 向内补偿尺度。 |
 | `--hand-roi-inward-shift` | `0.1` | 浮点；内部 `>=0` | 逆前向方向平移补偿。 |
 | `--hand-roi-direction-smooth` | `0.35` | 语法浮点；内部 clamp `[0,1]` | ROI 方向平滑，降低外扩方向抖动。 |
@@ -119,6 +120,20 @@ uv run python -m src.app --help
 | `--hand-roi-hold-frames` | `2` | 整数；内部 `>=0` | ROI 丢点保持帧数。 |
 | `--hand-roi-shrink-floor` | `0.9` | 语法浮点；内部 clamp `[0,1]` | 防止 ROI 帧间骤缩。 |
 | `--hand-roi-size-smooth` | `0.35` | 语法浮点；内部 clamp `[0,1]` | ROI 中心/大小平滑系数。 |
+| `--roi-object-max-area-ratio` | `0.62` | 浮点；`<=0` 关闭 | ROI 检测目标占 ROI 面积过大时过滤，聚焦小物体。 |
+| `--roi-partial-suppress` / `--no-roi-partial-suppress` | `True` | 布尔开关 | 合并前抑制 ROI 局部重复（全图已检出同一大物体）。 |
+| `--roi-partial-overlap` | `0.84` | 浮点；建议 `[0.7,0.95]` | ROI-vs-全图局部重复抑制重叠阈值（交集/小框面积）。 |
+| `--roi-partial-area-ratio` | `0.62` | 浮点；建议 `[0.3,0.9]` | ROI/全图面积比上限，越小越偏向“只保留全图大框”。 |
+| `--roi-partial-score-margin` | `0.08` | 浮点；建议 `[0,0.3]` | ROI 分数可高于全图多少仍判为局部冲突。 |
+| `--unknown-roi-fallback` / `--no-unknown-roi-fallback` | `True` | 布尔开关 | ROI 无已知类别时，启用轮廓回退并输出 `unknown` mask。 |
+| `--unknown-min-area-ratio` | `0.012` | 浮点；建议 `[0.004, 0.08]` | unknown 轮廓最小面积占 ROI 比例。 |
+| `--unknown-max-area-ratio` | `0.55` | 浮点；建议 `[0.3, 0.9]` | unknown 轮廓最大面积占 ROI 比例。 |
+| `--unknown-max-hand-dist-ratio` | `0.58` | 浮点；建议 `[0.3, 1.2]` | unknown 轮廓中心到手中心的最大距离比例。 |
+| `--unknown-max-hand-overlap-ratio` | `0.68` | 浮点；建议 `[0.3, 0.95]` | unknown 候选与手区最大重叠比例。 |
+| `--unknown-min-fill-ratio` | `0.22` | 浮点；建议 `[0.1, 0.7]` | unknown mask 在其 bbox 内的填充比例下限。 |
+| `--unknown-min-solidity` | `0.55` | 浮点；建议 `[0.3, 0.95]` | unknown mask 相对凸包的实心程度下限。 |
+| `--unknown-max-aspect-ratio` | `3.2` | 浮点；建议 `[1.5, 8]` | unknown bbox 最大长宽比，抑制细线型轮廓。 |
+| `--unknown-border-margin` | `3` | 整数；建议 `[0, 12]` | unknown 轮廓贴近 ROI 边界的剔除边距。 |
 
 ---
 
