@@ -36,7 +36,7 @@ from .postprocess.object_filter import deduplicate_objects
 from .postprocess.object_temporal import ObjectTemporalStabilizer
 from .types import ActionResult, ContactResult, DetectedObject, TrackedPerson
 from .vision.class_whitelist import load_whitelist_from_config
-from .vision.detect import infer_objects, load_det_model
+from .vision.detect import PredictOptions, infer_objects, infer_objects_batch, load_det_model
 from .vision.hand_mediapipe import (
     create_hand_landmarker,
     detect_hands,
@@ -90,6 +90,42 @@ def parse_args() -> argparse.Namespace:
         "--device",
         default=None,
         help="Device to run on (e.g. 0, 0,1, or cpu).",
+    )
+    parser.add_argument(
+        "--pred-iou",
+        type=float,
+        default=0.7,
+        help="Ultralytics predict iou threshold (0-1, official default: 0.7).",
+    )
+    parser.add_argument(
+        "--pred-max-det",
+        type=int,
+        default=300,
+        help="Ultralytics predict max_det (>=1, official default: 300).",
+    )
+    parser.add_argument(
+        "--pred-agnostic-nms",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Ultralytics predict agnostic_nms.",
+    )
+    parser.add_argument(
+        "--pred-half",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Ultralytics predict half. Usually only useful on CUDA.",
+    )
+    parser.add_argument(
+        "--pred-retina-masks",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Ultralytics predict retina_masks (higher-quality masks, slower).",
+    )
+    parser.add_argument(
+        "--pred-batch",
+        type=int,
+        default=1,
+        help="Ultralytics predict batch (>=1, mainly used for multi-ROI batched inference).",
     )
 
     parser.add_argument(
@@ -446,6 +482,12 @@ def parse_args() -> argparse.Namespace:
         help="Enable all debug overlays (ROI boxes, counters, diagnostics).",
     )
     parser.add_argument(
+        "--draw-mask-edges",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Draw segmentation mask contours in preview (default: on, use --no-draw-mask-edges to force bbox-only).",
+    )
+    parser.add_argument(
         "--hand-roi-debug",
         action="store_true",
         help="Show hand ROI boxes in preview.",
@@ -501,6 +543,14 @@ def main() -> int:
     args = parse_args()
     det_include_names = _parse_name_csv(args.det_include)
     det_exclude_names = _parse_name_csv(args.det_exclude)
+    predict_options = PredictOptions(
+        iou=args.pred_iou,
+        max_det=args.pred_max_det,
+        agnostic_nms=args.pred_agnostic_nms,
+        half=args.pred_half,
+        retina_masks=args.pred_retina_masks,
+        batch=args.pred_batch,
+    )
 
     if args.det_whitelist_config:
         whitelist_path = Path(args.det_whitelist_config).expanduser()
@@ -623,7 +673,9 @@ def main() -> int:
                 break
 
             now = time.time()
+            stage_ms: dict[str, float] = {}
             # 姿态推理：默认仅保留置信度最高的单人结果。
+            pose_t0 = time.time()
             pose_batch = infer_pose(
                 pose_model,
                 frame,
@@ -632,11 +684,17 @@ def main() -> int:
                 device=args.device,
                 return_result=show_preview,
                 top_k=1,
+                iou=args.pred_iou,
+                max_det=args.pred_max_det,
+                agnostic_nms=args.pred_agnostic_nms,
+                half=args.pred_half,
             )
+            stage_ms["pose"] = (time.time() - pose_t0) * 1000.0
 
             # 全图目标检测/分割；若 hand_roi_only 开启，则跳过全图检测。
             det_batch = None
             if not args.hand_roi_only:
+                full_det_t0 = time.time()
                 det_batch = infer_objects(
                     det_model,
                     frame,
@@ -646,7 +704,11 @@ def main() -> int:
                     include_names=det_include_names,
                     exclude_names=det_exclude_names,
                     return_result=False,
+                    predict_options=predict_options,
                 )
+                stage_ms["det_full"] = (time.time() - full_det_t0) * 1000.0
+            else:
+                stage_ms["det_full"] = 0.0
 
             # 单人追踪：用于维持动作状态的时间连续性。
             persons = tracker.update(pose_batch.detections, now)
@@ -657,12 +719,14 @@ def main() -> int:
             roi_objects: list[DetectedObject] = []
             rois: list[tuple[int, int, int, int]] = []
 
+            hands_t0 = time.time()
             timestamp_ms = int(now * 1000)
             hands = detect_hands(hand_landmarker, frame, timestamp_ms)
             if args.hand_stabilize:
                 hands_lr = hand_stabilizer.update(hands, frame_shape=frame.shape[:2])
             else:
                 hands_lr = to_left_right_map(hands)
+            stage_ms["hands"] = (time.time() - hands_t0) * 1000.0
 
             if hands and hands_lr.get("left") is None and hands_lr.get("right") is None:
                 # 兜底策略：稳定器短时给空时，回退到原始 left/right 映射。
@@ -670,6 +734,7 @@ def main() -> int:
 
             use_roi_det = args.hand_roi_det or args.hand_roi_only
             has_hand_roi_seed = hands_lr.get("left") is not None or hands_lr.get("right") is not None
+            roi_det_t0 = time.time()
             if use_roi_det and has_hand_roi_seed:
                 rois = hand_roi_builder.build(hands_lr, frame.shape[:2])
                 roi_objects = _infer_objects_on_rois(
@@ -681,7 +746,9 @@ def main() -> int:
                     device=args.device,
                     include_names=det_include_names,
                     exclude_names=det_exclude_names,
+                    predict_options=predict_options,
                 )
+            stage_ms["det_roi"] = (time.time() - roi_det_t0) * 1000.0
 
             full_frame_objects = det_batch.objects if det_batch else []
             all_objects = roi_objects if args.hand_roi_only else (full_frame_objects + roi_objects)
@@ -705,6 +772,7 @@ def main() -> int:
             else:
                 objects_for_contact = all_objects
 
+            post_t0 = time.time()
             for person in persons:
                 # 当前默认单人场景，直接复用全帧手结果到当前 track。
                 hand_points[person.track_id] = hands_lr
@@ -720,6 +788,7 @@ def main() -> int:
                     dist_threshold=args.contact_dist,
                     min_points=args.contact_min_points,
                 )
+            stage_ms["post"] = (time.time() - post_t0) * 1000.0
 
             # 输出节流：interval <= 0 表示每帧输出。
             if args.interval <= 0:
@@ -759,6 +828,7 @@ def main() -> int:
                     objects_for_contact,
                     hand_points,
                     global_hands=hands_lr,
+                    draw_mask_edges=args.draw_mask_edges,
                 )
                 if debug_all:
                     dt = max(1e-6, now - prev_frame_ts)
@@ -779,6 +849,14 @@ def main() -> int:
                                 f"{int(hands_lr.get('right') is not None)}"
                             ),
                             f"rois:{len(rois)}",
+                            (
+                                "ms "
+                                f"pose:{stage_ms.get('pose', 0.0):.1f} "
+                                f"full:{stage_ms.get('det_full', 0.0):.1f} "
+                                f"roi:{stage_ms.get('det_roi', 0.0):.1f} "
+                                f"hand:{stage_ms.get('hands', 0.0):.1f} "
+                                f"post:{stage_ms.get('post', 0.0):.1f}"
+                            ),
                         ],
                     )
                 cv2.imshow("Action + Contact", annotated)
@@ -841,11 +919,12 @@ def _draw_overlay(
     objects,
     hands: dict[int, dict[str, list[tuple[float, float, float]] | None]],
     global_hands: dict[str, list[tuple[float, float, float]] | None] | None = None,
+    draw_mask_edges: bool = False,
 ) -> None:
     """在预览画面绘制目标框、动作标签、接触结果与手关键点。"""
     for obj_idx, obj in enumerate(objects):
         x1, y1, x2, y2 = [int(v) for v in obj.bbox]
-        if obj.mask is not None:
+        if draw_mask_edges and obj.mask is not None:
             _draw_mask_edges(frame, obj.mask, color=(0, 200, 0), thickness=2)
         else:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
@@ -990,25 +1069,42 @@ def _infer_objects_on_rois(
     device: str | None,
     include_names: tuple[str, ...],
     exclude_names: tuple[str, ...],
+    predict_options: PredictOptions,
 ) -> list[DetectedObject]:
-    """在多个 ROI 上执行检测，并将结果映射回原图坐标系。"""
-    results: list[DetectedObject] = []
-    h, w = frame.shape[:2]
-    for roi in rois:
-        x1, y1, x2, y2 = roi
+    """在多个 ROI 上批量执行检测，并将结果映射回原图坐标系。"""
+    if not rois:
+        return []
+
+    valid_rois: list[tuple[int, int, int, int]] = []
+    crops: list[np.ndarray] = []
+    for x1, y1, x2, y2 in rois:
+        if x2 <= x1 or y2 <= y1:
+            continue
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             continue
-        batch = infer_objects(
-            det_model,
-            crop,
-            conf=conf,
-            imgsz=imgsz,
-            device=device,
-            include_names=include_names,
-            exclude_names=exclude_names,
-            return_result=False,
-        )
+        valid_rois.append((x1, y1, x2, y2))
+        crops.append(crop)
+
+    if not crops:
+        return []
+
+    batches = infer_objects_batch(
+        det_model,
+        crops,
+        conf=conf,
+        imgsz=imgsz,
+        device=device,
+        include_names=include_names,
+        exclude_names=exclude_names,
+        return_result=False,
+        predict_options=predict_options,
+    )
+
+    results: list[DetectedObject] = []
+    h, w = frame.shape[:2]
+    for roi, batch in zip(valid_rois, batches):
+        x1, y1, x2, y2 = roi
         for obj in batch.objects:
             bx1, by1, bx2, by2 = obj.bbox
             mapped_bbox = (bx1 + x1, by1 + y1, bx2 + x1, by2 + y1)

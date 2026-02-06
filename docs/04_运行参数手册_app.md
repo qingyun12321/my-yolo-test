@@ -25,6 +25,12 @@ uv run python -m src.app --help
 | `--conf` | `0.2` | 浮点数，建议 `[0.05, 0.7]` | 姿态与检测共用置信度阈值；过低增误检，过高增漏检。 |
 | `--imgsz` | `640` | 正整数，建议 `320~1280` | 推理输入尺寸，越大越准但更慢。 |
 | `--device` | `None` | `cpu` / `0` / `0,1` 等 | 推理设备；`None` 交由底层自动选择。 |
+| `--pred-iou` | `0.7` | 浮点；内部 clamp `[0,1]` | Ultralytics `predict` 的 NMS IoU 阈值。 |
+| `--pred-max-det` | `300` | 整数；内部下限 `1` | 每帧最多保留检测数；减小可提升速度并抑制长尾误检。 |
+| `--pred-agnostic-nms` / `--no-pred-agnostic-nms` | `False` | 布尔开关 | 类别无关 NMS；多类别重叠严重时可尝试开启。 |
+| `--pred-half` / `--no-pred-half` | `False` | 布尔开关 | 半精度推理；通常仅在 CUDA 设备上有收益。 |
+| `--pred-retina-masks` / `--no-pred-retina-masks` | `False` | 布尔开关 | 更高分辨率 mask，边界更细但更慢。 |
+| `--pred-batch` | `1` | 整数；内部下限 `1` | `predict` 批处理大小；对多 ROI 批量推理有效。 |
 
 ---
 
@@ -120,7 +126,8 @@ uv run python -m src.app --help
 
 | 参数 | 默认值 | 允许值/范围 | 影响与备注 |
 |---|---:|---|---|
-| `--debug` / `--no-debug` | `False` | 布尔开关 | 一键开启所有调试叠加。 |
+| `--debug` / `--no-debug` | `False` | 布尔开关 | 一键开启所有调试叠加（含 FPS、计数、阶段耗时）。 |
+| `--draw-mask-edges` / `--no-draw-mask-edges` | `True` | 布尔开关 | 是否绘制分割 mask 轮廓；关闭后仅绘制 bbox，预览更快。 |
 | `--hand-roi-debug` | `False` | 布尔开关 | 单独开启 ROI 矩形可视化。 |
 | `--no-preview` | `False` | 布尔开关 | 关闭窗口显示，仅做计算/日志。 |
 | `--log-path` | `None` | 文件路径 | JSONL 日志自定义路径。 |
@@ -152,6 +159,9 @@ uv run python -m src.app --help
 2. `--hand-smooth-alpha`（适当增大）
 3. `--hand-smooth-motion-scale`（适当减小）
 4. `--obj-temporal-bbox-alpha`（适当增大）
+5. `--pred-max-det`（适当降低，如 `300 -> 120`）
+6. `--no-draw-mask-edges`（预览卡顿时先关闭 mask 轮廓绘制）
+7. `--pred-batch`（多 ROI 时可尝试 `2~4`）
 
 ---
 
@@ -162,3 +172,4 @@ uv run python -m src.app --help
 - `--interval <= 0` 时每帧输出日志，吞吐和磁盘压力会明显上升；
 - `--no-preview` 常用于服务化或离线压测；
 - `--debug` 会增加绘制开销，性能评估时建议关闭。
+- 默认启用 `--draw-mask-edges`（分割轮廓可视化）；若只关心速度可加 `--no-draw-mask-edges`。

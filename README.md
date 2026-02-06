@@ -7,6 +7,7 @@
 
 - 基于 YOLO pose + YOLO seg + MediaPipe 的多模块融合；
 - 引入手部 ROI 二次检测，提升手持小目标识别；
+- ROI 检测路径采用批量推理，降低多 ROI 时的重复调用开销；
 - 引入手关键点稳定、目标去重、跨类冲突抑制、目标时序稳定；
 - 白名单可从训练配置 YAML 自动导入，训练/推理类别定义同源。
 
@@ -29,6 +30,12 @@ uv run python -m src.app \
   --det-whitelist-mode override \
   --debug
 ```
+
+说明：
+
+- 目标可视化默认优先显示分割 `mask` 轮廓；
+- 如需仅显示 `bbox` 以换取更高预览帧率，可追加 `--no-draw-mask-edges`；
+- 推理参数已对齐官方常用项，可直接通过 `--pred-*` 参数调节（如 `--pred-iou`、`--pred-max-det`）。
 
 ## 4. 目录速览
 

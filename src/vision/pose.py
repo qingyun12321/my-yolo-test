@@ -44,6 +44,10 @@ def infer_pose(
     device: str | None,
     return_result: bool = False,
     top_k: int | None = 1,
+    iou: float = 0.7,
+    max_det: int = 300,
+    agnostic_nms: bool = False,
+    half: bool = False,
 ) -> PoseBatch:
     """执行姿态推理并返回结构化结果。
 
@@ -60,10 +64,19 @@ def infer_pose(
     返回:
         PoseBatch: 姿态检测列表与可选原始结果。
     """
+    predict_max_det = max(1, int(max_det))
+    if top_k is not None and top_k > 0:
+        # 在 predict 阶段就限制最大检测数，避免“先算很多再截断”的无效开销。
+        predict_max_det = min(predict_max_det, int(top_k))
+
     results = model.predict(
         source=frame,
         conf=conf,
+        iou=float(max(0.0, min(iou, 1.0))),
         imgsz=imgsz,
+        max_det=predict_max_det,
+        agnostic_nms=bool(agnostic_nms),
+        half=bool(half),
         device=device,
         verbose=False,
     )
