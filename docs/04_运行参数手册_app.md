@@ -89,7 +89,7 @@ uv run python -m src.app --help
 | `--obj-conflict-area-ratio` | `1.8` | 浮点，内部 `>=1` | 冲突判定面积比阈值。 |
 | `--obj-conflict-score-gap` | `0.15` | 浮点，内部 `>=0` | 分数差超过该值时直接保留高分。 |
 | `--obj-temporal` / `--no-obj-temporal` | `True` | 布尔开关 | 目标时序稳定器开关（强烈建议开启）。 |
-| `--obj-temporal-hold-frames` | `3` | 整数，内部 `>=0` | 目标短时丢失保持帧数。 |
+| `--obj-temporal-hold-frames` | `3` | 整数，内部 `>=0` | 目标轨迹内部丢失保留帧数（用于重关联）；可视化输出在无检测场景最多仅保留 1 帧，避免残影。 |
 | `--obj-temporal-min-hits` | `1` | 整数，内部 `>=1` | 轨迹至少命中 N 次才输出。 |
 | `--obj-temporal-iou` | `0.32` | 建议 `[0,1]` | 目标跨帧匹配 IoU 下限。 |
 | `--obj-temporal-center-ratio` | `0.72` | 浮点，内部 `>=0` | 跨帧匹配中心距离比例阈值。 |

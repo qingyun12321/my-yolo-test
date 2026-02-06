@@ -384,7 +384,10 @@ def parse_args() -> argparse.Namespace:
         "--obj-temporal-hold-frames",
         type=int,
         default=3,
-        help="Keep objects for N frames when temporarily occluded/missed.",
+        help=(
+            "Keep internal tracks for N missed frames for re-association. "
+            "Visual output keeps at most 1 no-detection frame to avoid ghost trails."
+        ),
     )
     parser.add_argument(
         "--obj-temporal-min-hits",
@@ -925,6 +928,17 @@ def main() -> int:
 
             if object_temporal is not None:
                 objects_for_contact = object_temporal.update(all_objects)
+                if args.obj_dedup:
+                    # 时序输出可能因轨迹重关联失败出现瞬时分裂，这里再做一次兜底去重。
+                    objects_for_contact = deduplicate_objects(
+                        objects_for_contact,
+                        iou_threshold=args.obj_dedup_iou,
+                        center_ratio=args.obj_dedup_center_ratio,
+                        conflict_suppress=args.obj_conflict_suppress,
+                        conflict_overlap=args.obj_conflict_overlap,
+                        conflict_area_ratio=args.obj_conflict_area_ratio,
+                        conflict_score_gap=args.obj_conflict_score_gap,
+                    )
             else:
                 objects_for_contact = all_objects
 

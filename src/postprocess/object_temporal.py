@@ -58,9 +58,13 @@ class ObjectTemporalStabilizer:
         """输入当前帧检测结果，输出稳定后的目标列表。"""
         self._decay_tracks()
         used_track_indices: set[int] = set()
+        single_detection_mode = len(objects) == 1
 
         for obj in sorted(objects, key=lambda item: float(item.score), reverse=True):
             match_idx = self._find_match_track(obj, used_track_indices)
+            if match_idx is None and single_detection_mode:
+                # 单目标帧下启用更宽松重关联，优先保持轨迹连续性。
+                match_idx = self._find_relaxed_track(obj, used_track_indices)
             if match_idx is None:
                 self._tracks.append(
                     _ObjectTrack(
@@ -87,7 +91,7 @@ class ObjectTemporalStabilizer:
             track.score = float(track.score * self.score_decay)
 
         self._tracks = [track for track in self._tracks if track.misses <= self.hold_frames]
-        return self._emit_objects()
+        return self._emit_objects(has_current_objects=bool(objects))
 
     def _decay_tracks(self) -> None:
         """衰减各轨迹的类别历史分数，避免过久历史主导当前判断。"""
@@ -115,15 +119,58 @@ class ObjectTemporalStabilizer:
 
             iou = _bbox_iou(obj.bbox, track.bbox)
             center_ratio = _bbox_center_ratio(obj.bbox, track.bbox)
-            if iou < self.match_iou and center_ratio > self.match_center_ratio:
-                continue
+            if iou < self.match_iou:
+                # 快速运动重关联兜底：
+                # 当 IoU 一时不足，但中心位移与尺度仍在可接受范围时，允许继续关联，
+                # 避免同一物体被切成多条短轨迹（移动时多标签的主要来源）。
+                area_ratio = _bbox_area_ratio(obj.bbox, track.bbox)
+                relaxed_center_limit = max(1e-6, self.match_center_ratio * 1.9)
+                fast_motion_relink = (
+                    center_ratio <= relaxed_center_limit
+                    and 0.35 <= area_ratio <= 2.8
+                )
+                if not fast_motion_relink:
+                    continue
 
             # 几何匹配分 + 类别一致奖励
-            geom = iou + max(0.0, 1.0 - center_ratio / max(1e-6, self.match_center_ratio)) * 0.35
+            overlap = _overlap_small_ratio(obj.bbox, track.bbox)
+            geom = max(iou, overlap) + max(
+                0.0, 1.0 - center_ratio / max(1e-6, self.match_center_ratio)
+            ) * 0.35
             class_bonus = 0.12 if obj.name == track.name else 0.0
             score = geom + class_bonus
             if score > best_score:
                 best_score = score
+                best_idx = idx
+        return best_idx
+
+    def _find_relaxed_track(
+        self,
+        obj: DetectedObject,
+        used_track_indices: set[int],
+    ) -> int | None:
+        """单目标场景下的宽松重关联（用于抗快速位移分裂）。"""
+        best_idx: int | None = None
+        best_cost = float("inf")
+        center_limit = max(1e-6, self.match_center_ratio * 2.6)
+        for idx, track in enumerate(self._tracks):
+            if idx in used_track_indices:
+                continue
+
+            center_ratio = _bbox_center_ratio(obj.bbox, track.bbox)
+            if center_ratio > center_limit:
+                continue
+
+            area_ratio = _bbox_area_ratio(obj.bbox, track.bbox)
+            if area_ratio > 4.0:
+                continue
+
+            # cost 越小越好：优先中心更近、miss 更少、类别更一致。
+            cost = center_ratio + float(track.misses) * 0.35
+            if obj.name == track.name:
+                cost -= 0.15
+            if cost < best_cost:
+                best_cost = cost
                 best_idx = idx
         return best_idx
 
@@ -158,22 +205,40 @@ class ObjectTemporalStabilizer:
         else:
             track.name = obj.name
 
-    def _emit_objects(self) -> list[DetectedObject]:
-        """将轨迹状态转换为可用的检测目标列表。"""
+    def _emit_objects(self, has_current_objects: bool) -> list[DetectedObject]:
+        """将轨迹状态转换为可用的检测目标列表。
+
+        设计要点：
+        1. 只要当前帧存在观测目标，就不输出 miss 轨迹，避免旧位置残影；
+        2. 当仅靠 hold 保留轨迹时，不再输出历史 mask，防止旧轮廓残留。
+        """
         emitted: list[DetectedObject] = []
         for track in self._tracks:
             if track.hits < self.min_hits:
                 continue
 
+            if track.misses > 1:
+                # 无检测阶段最多只保留 1 帧输出，后续帧隐藏以消除旧位置残留。
+                continue
+
+            if track.misses > 0 and has_current_objects:
+                # 当前帧已有真实观测时，直接隐藏 miss 轨迹，避免“旧位置还挂着一层轮廓”。
+                continue
+
             # 对遮挡保持阶段的分数做可控衰减，避免“僵尸框”长期存在。
             score = float(track.score * (self.score_decay ** track.misses))
             score = max(0.0, min(1.0, score))
+            if score < 0.08:
+                continue
+
+            # miss 阶段不输出历史 mask，防止画面出现旧轮廓残影。
+            emit_mask = track.mask if track.misses <= 0 else None
             emitted.append(
                 DetectedObject(
                     name=track.name,
                     bbox=track.bbox,
                     score=score,
-                    mask=track.mask,
+                    mask=emit_mask,
                 )
             )
 
@@ -181,22 +246,76 @@ class ObjectTemporalStabilizer:
 
 
 def _dedupe_emitted(objects: list[DetectedObject]) -> list[DetectedObject]:
-    """对输出做一次轻量去重，避免轨迹短时分裂带来双框。"""
+    """对输出做一次轻量去重，避免轨迹短时分裂带来多标签。"""
     if not objects:
         return []
-    ranked = sorted(objects, key=lambda item: float(item.score), reverse=True)
+
+    # 优先保留“已知类别 + 有 mask + 高分”的目标，unknown 与低分候选靠后。
+    ranked = sorted(objects, key=_emitted_quality, reverse=True)
     kept: list[DetectedObject] = []
     for obj in ranked:
-        duplicate = False
-        for other in kept:
-            if obj.name != other.name:
+        dropped = False
+        idx = 0
+        while idx < len(kept):
+            other = kept[idx]
+            iou = _bbox_iou(obj.bbox, other.bbox)
+            overlap = _overlap_small_ratio(obj.bbox, other.bbox)
+            center_ratio = _bbox_center_ratio(obj.bbox, other.bbox)
+            area_ratio = _bbox_area_ratio(obj.bbox, other.bbox)
+            same_class = obj.name == other.name
+
+            if same_class:
+                same_class_duplicate = (
+                    iou >= 0.65
+                    or overlap >= 0.82
+                    or (center_ratio <= 0.36 and 0.40 <= area_ratio <= 2.5)
+                )
+                if same_class_duplicate:
+                    dropped = True
+                    break
+                idx += 1
                 continue
-            if _bbox_iou(obj.bbox, other.bbox) >= 0.8 or _overlap_small_ratio(obj.bbox, other.bbox) >= 0.9:
-                duplicate = True
+
+            # 跨类别强冲突：高重叠 + 中心接近，通常是同一物体的类别抖动。
+            cross_class_conflict = overlap >= 0.90 or (
+                iou >= 0.68 and center_ratio <= 0.32 and 0.35 <= area_ratio <= 2.8
+            )
+            if not cross_class_conflict:
+                idx += 1
+                continue
+
+            better = _prefer_emitted_object(obj, other)
+            if better is other:
+                dropped = True
                 break
-        if not duplicate:
+            kept.pop(idx)
+
+        if not dropped:
             kept.append(obj)
     return kept
+
+
+def _emitted_quality(obj: DetectedObject) -> tuple[int, int, float, float]:
+    """定义时序输出质量排序：已知类别优先，其次 mask、分数、面积。"""
+    return (
+        0 if obj.name == "unknown" else 1,
+        1 if obj.mask is not None else 0,
+        float(obj.score),
+        _bbox_area(obj.bbox),
+    )
+
+
+def _prefer_emitted_object(a: DetectedObject, b: DetectedObject) -> DetectedObject:
+    """跨类别冲突时保留更可信目标。"""
+    # 已知类别优先于 unknown，避免 unknown 抢占已知目标。
+    if a.name == "unknown" and b.name != "unknown":
+        return b
+    if b.name == "unknown" and a.name != "unknown":
+        return a
+
+    if abs(float(a.score) - float(b.score)) >= 0.12:
+        return a if a.score > b.score else b
+    return a if _emitted_quality(a) >= _emitted_quality(b) else b
 
 
 def _bbox_iou(a: BBox, b: BBox) -> float:
@@ -230,6 +349,17 @@ def _bbox_center_ratio(a: BBox, b: BBox) -> float:
     if scale <= 1e-6:
         return float("inf")
     return float(dist / scale)
+
+
+def _bbox_area_ratio(a: BBox, b: BBox) -> float:
+    """计算边框面积比（大/小）。"""
+    area_a = _bbox_area(a)
+    area_b = _bbox_area(b)
+    small = min(area_a, area_b)
+    if small <= 1e-6:
+        return float("inf")
+    large = max(area_a, area_b)
+    return float(large / small)
 
 
 def _bbox_area(bbox: BBox) -> float:
