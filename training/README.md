@@ -1,5 +1,9 @@
 # 分割训练流程（与 Ultralytics 官方一致）
 
+> 若需要更详细说明（参数字典、数据格式、排障建议），请阅读：
+> - `docs/06_训练全流程指南.md`
+> - `docs/07_数据集格式规范.md`
+
 本流程按官方推荐顺序组织：
 1. COCO JSON 标注转换为 YOLO 格式（JSON2YOLO/Ultralytics converter）；
 2. 配置数据集 YAML（`data=...`）；
@@ -23,7 +27,7 @@
 ### 使用本项目脚本（封装官方 `convert_coco(use_segments=True)`）
 
 ```bash
-uv run python tools/convert_coco_to_yolo_seg.py \
+uv run python tools/datasets/segment/convert_coco_to_yolo_seg.py \
   --labels-dir datasets/coco-json/annotations \
   --save-dir datasets/yolo-seg \
   --cls91to80
@@ -57,7 +61,7 @@ yolo segment train data=training/configs/segment_data.yaml model=models/yolo26n-
 ### 本项目脚本（参数语义与官方一致）
 
 ```bash
-uv run python tools/train_segment_objects.py \
+uv run python tools/train/segment/train_segment_objects.py \
   --data training/configs/segment_data.yaml \
   --model models/yolo26n-seg.pt \
   --epochs 100 \
@@ -78,7 +82,7 @@ uv run python tools/train_segment_objects.py \
 示例：
 
 ```bash
-uv run python tools/train_segment_objects.py \
+uv run python tools/train/segment/train_segment_objects.py \
   --data training/configs/segment_data.yaml \
   --model models/yolo26n-seg.pt \
   --cfg training/configs/custom_train.yaml \

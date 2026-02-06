@@ -1,0 +1,164 @@
+# 运行参数手册（`src.app`）
+
+本手册对应命令：
+
+```bash
+uv run python -m src.app --help
+```
+
+说明规则：
+
+- “允许值”写的是**语法层**可接受值；
+- “建议范围”写的是**业务层**更稳妥区间；
+- 若代码内部有二次裁剪（clamp），会在“影响/备注”列注明。
+
+---
+
+## 1. 基础模型与输入参数
+
+| 参数 | 默认值 | 允许值/范围 | 影响与备注 |
+|---|---:|---|---|
+| `--pose-model` | `models/yolo26n-pose.pt` | 有效模型路径或模型名 | 姿态模型来源，影响动作识别与人体框质量。 |
+| `--det-model` | `models/yolo26n-seg.pt` | 有效模型路径或模型名 | 目标检测/分割模型来源，影响物体识别与接触判定。 |
+| `--hand-model` | `models/hand_landmarker.task` | 有效路径 | MediaPipe 手关键点模型路径；不存在会自动下载。 |
+| `--source` | `None` | 摄像头索引（如 `0`）或设备路径 | 视频输入源；为空时使用 `default_source()`。 |
+| `--conf` | `0.2` | 浮点数，建议 `[0.05, 0.7]` | 姿态与检测共用置信度阈值；过低增误检，过高增漏检。 |
+| `--imgsz` | `640` | 正整数，建议 `320~1280` | 推理输入尺寸，越大越准但更慢。 |
+| `--device` | `None` | `cpu` / `0` / `0,1` 等 | 推理设备；`None` 交由底层自动选择。 |
+
+---
+
+## 2. 手检测与手稳定参数
+
+| 参数 | 默认值 | 允许值/范围 | 影响与备注 |
+|---|---:|---|---|
+| `--hand-num` | `2` | 整数，建议 `1~4` | 手检测上限；真实单人场景通常 `2` 足够。 |
+| `--hand-det-conf` | `0.5` | `[0,1]` | 手检测置信度阈值。 |
+| `--hand-presence-conf` | `0.5` | `[0,1]` | 手存在置信度阈值。 |
+| `--hand-track-conf` | `0.5` | `[0,1]` | 手追踪置信度阈值。 |
+| `--hand-stabilize` / `--no-hand-stabilize` | `True` | 布尔开关 | 是否启用手关键点时序稳定器。建议开启。 |
+| `--hand-smooth-alpha` | `0.55` | 语法浮点；内部 clamp 到 `[0,1]` | EMA 基础平滑系数；越小越稳但更迟滞。 |
+| `--hand-smooth-adaptive` / `--no-hand-smooth-adaptive` | `True` | 布尔开关 | 是否随手速自适应 alpha。 |
+| `--hand-smooth-fast-alpha` | `0.88` | 语法浮点；内部 clamp 到 `[0,1]` | 快速运动上限 alpha；越大越跟手。 |
+| `--hand-smooth-motion-scale` | `0.12` | `>0`（内部下限 `1e-6`） | 运动敏感度；越小越容易触发“快速模式”。 |
+| `--hand-hold-frames` | `2` | 整数 `>=0` | 手短时丢失保持帧数；越大越稳但可能残影。 |
+| `--hand-side-merge-ratio` | `0.45` | 浮点，内部 `>=0` | 左右手去重阈值（中心距离比例）；越大越容易合并为单手。 |
+
+---
+
+## 3. 帧率、输出节流、动作与接触参数
+
+| 参数 | 默认值 | 允许值/范围 | 影响与备注 |
+|---|---:|---|---|
+| `--fps` | `60.0` | 浮点，建议 `>=1` | 请求摄像头帧率；设备可能不完全遵守。 |
+| `--interval` | `0.5` | 浮点；`<=0` 表示每帧输出 | 输出节流间隔（日志/stdout），不影响推理本身。 |
+| `--keypoint-conf` | `0.2` | 浮点，建议 `[0,1]` | 人体关键点最低置信度阈值，影响动作与接触回退逻辑。 |
+| `--contact-expand` | `30` | 整数，建议 `0~80` | 接触判定时 mask/bbox 膨胀像素。 |
+| `--contact-dist` | `20.0` | 浮点，建议 `5~60` | 点到物体最大距离阈值；越大越宽松。 |
+| `--contact-min-points` | `1` | 整数 `>=1` | 接触最少命中点数；越大越严格。 |
+
+---
+
+## 4. 类别过滤与白名单联动参数
+
+| 参数 | 默认值 | 允许值/范围 | 影响与备注 |
+|---|---:|---|---|
+| `--det-include` | `None` | 逗号分隔字符串，如 `cup,bottle` | 仅保留指定类别；空表示不过滤。 |
+| `--det-exclude` | `person,hand,...` | 逗号分隔字符串 | 排除类别名单；默认排除人/手相关。 |
+| `--det-whitelist-config` | `None` | YAML 路径 | 从训练配置读取白名单。 |
+| `--det-whitelist-field` | `names` | 点分路径字符串，如 `data.names` | 指定白名单字段路径。 |
+| `--det-whitelist-mode` | `override` | `override` / `union` | `override` 用 YAML 替换命令行；`union` 做并集。 |
+
+---
+
+## 5. 目标后处理与时序稳定参数
+
+| 参数 | 默认值 | 允许值/范围 | 影响与备注 |
+|---|---:|---|---|
+| `--obj-dedup` / `--no-obj-dedup` | `True` | 布尔开关 | 同类去重与冲突抑制总开关。 |
+| `--obj-dedup-iou` | `0.45` | 建议 `[0,1]` | 同类去重 IoU 阈值。 |
+| `--obj-dedup-center-ratio` | `0.35` | 浮点，内部 `>=0` | 去重备用条件：中心距离比例阈值。 |
+| `--obj-conflict-suppress` / `--no-obj-conflict-suppress` | `True` | 布尔开关 | 跨类别嵌套冲突抑制开关。 |
+| `--obj-conflict-overlap` | `0.75` | 建议 `[0,1]` | 冲突判定重叠比例阈值（交集/小框面积）。 |
+| `--obj-conflict-area-ratio` | `1.8` | 浮点，内部 `>=1` | 冲突判定面积比阈值。 |
+| `--obj-conflict-score-gap` | `0.15` | 浮点，内部 `>=0` | 分数差超过该值时直接保留高分。 |
+| `--obj-temporal` / `--no-obj-temporal` | `True` | 布尔开关 | 目标时序稳定器开关（强烈建议开启）。 |
+| `--obj-temporal-hold-frames` | `3` | 整数，内部 `>=0` | 目标短时丢失保持帧数。 |
+| `--obj-temporal-min-hits` | `1` | 整数，内部 `>=1` | 轨迹至少命中 N 次才输出。 |
+| `--obj-temporal-iou` | `0.32` | 建议 `[0,1]` | 目标跨帧匹配 IoU 下限。 |
+| `--obj-temporal-center-ratio` | `0.72` | 浮点，内部 `>=0` | 跨帧匹配中心距离比例阈值。 |
+| `--obj-temporal-bbox-alpha` | `0.62` | 语法浮点；内部 clamp `[0,1]` | bbox/score EMA 系数；越大越跟手。 |
+| `--obj-temporal-class-decay` | `0.9` | 语法浮点；内部 clamp `[0,1]` | 类别历史投票衰减。 |
+| `--obj-temporal-score-decay` | `0.9` | 语法浮点；内部 clamp `[0,1]` | miss 阶段分数衰减，防止僵尸框。 |
+
+---
+
+## 6. ROI 检测参数（提升小物体识别核心）
+
+| 参数 | 默认值 | 允许值/范围 | 影响与备注 |
+|---|---:|---|---|
+| `--hand-roi-det` / `--no-hand-roi-det` | `True` | 布尔开关 | 是否启用 ROI 二次检测。 |
+| `--hand-roi-only` | `False` | 布尔开关 | 仅用 ROI 结果，不用全图结果。 |
+| `--hand-roi-padding` | `0.35` | 语法浮点；内部 clamp `[0,1]` | 手框基础 padding。 |
+| `--hand-roi-min-size` | `96` | 整数；内部下限 `32` | ROI 像素最小边。 |
+| `--hand-roi-min-size-ratio` | `0.12` | 语法浮点；内部 clamp `[0,1]` | ROI 最小尺寸占短边比例。 |
+| `--hand-roi-context-scale` | `1.9` | 浮点；内部下限 `1.0` | 前向/横向外扩基准比例。 |
+| `--hand-roi-forward-shift` | `0.42` | 浮点；内部 `>=0` | 沿手前向的额外平移。 |
+| `--hand-roi-inward-scale` | `1.18` | 浮点；内部下限 `1.0` | 向内补偿尺度。 |
+| `--hand-roi-inward-shift` | `0.1` | 浮点；内部 `>=0` | 逆前向方向平移补偿。 |
+| `--hand-roi-direction-smooth` | `0.35` | 语法浮点；内部 clamp `[0,1]` | ROI 方向平滑，降低外扩方向抖动。 |
+| `--hand-roi-merge-iou` | `0.7` | 语法浮点；内部 clamp `[0,1]` | 单侧 ROI 合并 IoU 阈值。 |
+| `--hand-roi-global-merge-iou` | `0.78` | 语法浮点；内部 clamp `[0,1]` | 跨左右 ROI 合并阈值。 |
+| `--hand-roi-cross-side-merge-ratio` | `0.45` | 浮点；内部 `>=0` | 左右手 ROI 种子距离判重阈值。 |
+| `--hand-roi-hold-frames` | `2` | 整数；内部 `>=0` | ROI 丢点保持帧数。 |
+| `--hand-roi-shrink-floor` | `0.9` | 语法浮点；内部 clamp `[0,1]` | 防止 ROI 帧间骤缩。 |
+| `--hand-roi-size-smooth` | `0.35` | 语法浮点；内部 clamp `[0,1]` | ROI 中心/大小平滑系数。 |
+
+---
+
+## 7. 调试、预览与日志参数
+
+| 参数 | 默认值 | 允许值/范围 | 影响与备注 |
+|---|---:|---|---|
+| `--debug` / `--no-debug` | `False` | 布尔开关 | 一键开启所有调试叠加。 |
+| `--hand-roi-debug` | `False` | 布尔开关 | 单独开启 ROI 矩形可视化。 |
+| `--no-preview` | `False` | 布尔开关 | 关闭窗口显示，仅做计算/日志。 |
+| `--log-path` | `None` | 文件路径 | JSONL 日志自定义路径。 |
+| `--no-log` | `False` | 布尔开关 | 禁用文件日志输出（stdout 仍保留）。 |
+
+---
+
+## 8. 参数调优优先级建议
+
+### 8.1 先调这 6 个
+
+1. `--conf`
+2. `--contact-dist`
+3. `--obj-dedup-iou`
+4. `--obj-conflict-overlap`
+5. `--hand-roi-context-scale`
+6. `--hand-roi-forward-shift`
+
+### 8.2 遮挡明显时再加这 4 个
+
+1. `--obj-temporal-hold-frames`
+2. `--obj-temporal-class-decay`
+3. `--contact-min-points`
+4. `--hand-roi-hold-frames`
+
+### 8.3 画面延迟明显时优先调
+
+1. `--imgsz`（先降）
+2. `--hand-smooth-alpha`（适当增大）
+3. `--hand-smooth-motion-scale`（适当减小）
+4. `--obj-temporal-bbox-alpha`（适当增大）
+
+---
+
+## 9. 参数冲突与注意事项
+
+- `--hand-roi-only` 开启后，全图物体会被忽略，适合“只关心手附近物体”的场景；
+- `--det-whitelist-mode override` 会覆盖 `--det-include`；
+- `--interval <= 0` 时每帧输出日志，吞吐和磁盘压力会明显上升；
+- `--no-preview` 常用于服务化或离线压测；
+- `--debug` 会增加绘制开销，性能评估时建议关闭。

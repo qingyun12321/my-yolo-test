@@ -9,7 +9,7 @@ wheels/
 # Virtual environments
 .venv
 
-output/
-models/
-datasets/
-runs/
+/output/
+/models/
+/datasets/
+/runs/
