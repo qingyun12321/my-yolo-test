@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-"""MediaPipe Hand Landmarker 推理封装。
+"""MediaPipe Hand Landmarker 封装。
 
-说明：
-    - 使用官方 Hand Landmarker 任务模型（.task）
-    - 采用 VIDEO 运行模式，以复用上一帧的手部 ROI（官方推荐的追踪方式）
-    - 若模型文件不存在，会自动下载到指定路径
+该模块负责：
+1. 自动准备 hand_landmarker.task 模型文件；
+2. 创建 VIDEO 模式的 Hand Landmarker；
+3. 将检测结果转换为像素坐标关键点；
+4. 提供 left/right 映射工具供下游稳定器使用。
 """
 
 from dataclasses import dataclass
@@ -17,8 +18,6 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-
-# 官方模型下载地址（Hand Landmarker 模型包）
 HAND_LANDMARKER_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
     "hand_landmarker/float16/1/hand_landmarker.task"
@@ -27,21 +26,14 @@ HAND_LANDMARKER_URL = (
 
 @dataclass(frozen=True)
 class HandResult:
-    """单手关键点检测结果。"""
+    """单只手的检测结果。"""
 
-    handedness: str  # "left" 或 "right"
+    handedness: str  # "left"、"right" 或 "unknown"
     keypoints: list[tuple[float, float, float]]
 
 
 def ensure_hand_model(model_path: Path) -> Path:
-    """确保 hand_landmarker.task 存在，不存在则自动下载。
-
-    参数:
-        model_path: 模型文件路径（应为 .task）。
-
-    返回:
-        Path: 实际可用的模型文件路径。
-    """
+    """确保 hand_landmarker.task 可用，不存在则自动下载。"""
     if model_path.exists():
         return model_path
 
@@ -57,32 +49,21 @@ def create_hand_landmarker(
     min_presence_confidence: float = 0.5,
     min_tracking_confidence: float = 0.5,
 ) -> "mp.tasks.vision.HandLandmarker":
-    """创建 MediaPipe Hand Landmarker 实例（VIDEO 模式）。
+    """创建 MediaPipe Hand Landmarker（VIDEO 模式）。"""
+    base_options = mp.tasks.BaseOptions
+    hand_landmarker = mp.tasks.vision.HandLandmarker
+    hand_options = mp.tasks.vision.HandLandmarkerOptions
+    running_mode = mp.tasks.vision.RunningMode
 
-    参数:
-        model_path: 模型路径（.task）。
-        num_hands: 最大检测手数量（>=1）。
-        min_detection_confidence: 检测阈值（0-1）。
-        min_presence_confidence: 关键点存在阈值（0-1）。
-        min_tracking_confidence: 追踪阈值（0-1）。
-
-    返回:
-        HandLandmarker: 任务实例。
-    """
-    BaseOptions = mp.tasks.BaseOptions
-    HandLandmarker = mp.tasks.vision.HandLandmarker
-    HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-    VisionRunningMode = mp.tasks.vision.RunningMode
-
-    options = HandLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=str(model_path)),
-        running_mode=VisionRunningMode.VIDEO,
+    options = hand_options(
+        base_options=base_options(model_asset_path=str(model_path)),
+        running_mode=running_mode.VIDEO,
         num_hands=max(1, int(num_hands)),
         min_hand_detection_confidence=float(min_detection_confidence),
         min_hand_presence_confidence=float(min_presence_confidence),
         min_tracking_confidence=float(min_tracking_confidence),
     )
-    return HandLandmarker.create_from_options(options)
+    return hand_landmarker.create_from_options(options)
 
 
 def detect_hands(
@@ -90,26 +71,16 @@ def detect_hands(
     frame_bgr: np.ndarray,
     timestamp_ms: int,
 ) -> list[HandResult]:
-    """在当前帧执行手部关键点检测。
-
-    参数:
-        landmarker: HandLandmarker 实例（VIDEO 模式）。
-        frame_bgr: OpenCV BGR 图像。
-        timestamp_ms: 视频时间戳（毫秒）。
-
-    返回:
-        list[HandResult]: 多手关键点结果（像素坐标）。
-    """
+    """检测当前帧的手关键点并输出像素坐标。"""
     height, width = frame_bgr.shape[:2]
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
 
     result = landmarker.detect_for_video(mp_image, timestamp_ms)
-    hand_results: list[HandResult] = []
-
     if not result.hand_landmarks:
-        return hand_results
+        return []
 
+    hand_results: list[HandResult] = []
     for hand_idx, landmarks in enumerate(result.hand_landmarks):
         handedness = "unknown"
         if result.handedness and hand_idx < len(result.handedness):
@@ -120,10 +91,9 @@ def detect_hands(
         for lm in landmarks:
             x = float(lm.x) * width
             y = float(lm.y) * height
-            # z 为相对深度，先映射到 conf 字段便于下游绘制阈值使用
+            # Tasks API 未提供稳定的单关键点置信度，这里统一设为 1.0。
+            # 这样可以避免绘制和接触判定因为“伪低置信度”而误丢点。
             conf = 1.0
-            if hasattr(lm, "visibility") and lm.visibility is not None:
-                conf = float(lm.visibility)
             keypoints.append((x, y, conf))
 
         hand_results.append(HandResult(handedness=handedness, keypoints=keypoints))
@@ -134,15 +104,11 @@ def detect_hands(
 def to_left_right_map(
     hands: Iterable[HandResult],
 ) -> dict[str, list[tuple[float, float, float]] | None]:
-    """将多手结果整理为 left/right 映射（优先保留置信度更稳定的一只手）。
-
-    参数:
-        hands: HandResult 列表。
-
-    返回:
-        dict: {"left": keypoints|None, "right": keypoints|None}
-    """
-    output: dict[str, list[tuple[float, float, float]] | None] = {"left": None, "right": None}
+    """将多手检测结果映射为 left/right 两个槽位。"""
+    output: dict[str, list[tuple[float, float, float]] | None] = {
+        "left": None,
+        "right": None,
+    }
     for item in hands:
         if item.handedness in ("left", "right") and output[item.handedness] is None:
             output[item.handedness] = item.keypoints

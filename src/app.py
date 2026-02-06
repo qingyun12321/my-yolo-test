@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-"""主应用入口：动作 + 物体接触检测。
+"""主应用入口：动作识别 + 手与物体接触检测。
 
-流程：
-1) 加载姿态模型与检测/分割模型
-2) 读取摄像头帧
-3) 计算姿态 + 物体
-4) 基于关键点规则识别动作
-5) 判断手与物体接触
-6) 输出结果（stdout + 可选 JSONL 文件）并可视化
+核心流程：
+1. 读取摄像头帧；
+2. 执行姿态推理与目标检测/分割；
+3. 执行手关键点检测，并通过时序稳定器降低抖动；
+4. 基于手关键点生成 ROI，在 ROI 内补充目标检测；
+5. 合并全图与 ROI 检测结果，并做去重/冲突抑制；
+6. 输出动作与接触判定结果（stdout + 可选 JSONL）。
 """
 
 import argparse
@@ -32,6 +32,7 @@ from .features.hand_skeleton import HAND_EDGES
 from .features.skeleton import normalize_keypoints
 from .io.capture import open_capture
 from .io.output import JsonlEmitter
+from .postprocess.object_filter import deduplicate_objects
 from .types import ActionResult, ContactResult, DetectedObject, TrackedPerson
 from .vision.detect import infer_objects, load_det_model
 from .vision.hand_mediapipe import (
@@ -40,16 +41,14 @@ from .vision.hand_mediapipe import (
     ensure_hand_model,
     to_left_right_map,
 )
+from .vision.hand_roi import HandRoiBuilder
+from .vision.hand_stabilizer import HandStabilizer
 from .vision.pose import infer_pose, load_pose_model
 from .vision.track import SimpleTracker
 
 
 def parse_args() -> argparse.Namespace:
-    """解析命令行参数。
-
-    返回:
-        argparse.Namespace: 解析后的参数对象。
-    """
+    """解析命令行参数并返回配置对象。"""
     parser = argparse.ArgumentParser(
         description="Lightweight action + contact detection using YOLO pose and detection."
     )
@@ -90,6 +89,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Device to run on (e.g. 0, 0,1, or cpu).",
     )
+
     parser.add_argument(
         "--hand-num",
         type=int,
@@ -114,6 +114,53 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Hand tracking confidence (0-1).",
     )
+
+    parser.add_argument(
+        "--hand-stabilize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable temporal stabilization for hand keypoints and left/right assignment.",
+    )
+    parser.add_argument(
+        "--hand-smooth-alpha",
+        type=float,
+        default=0.55,
+        help="Base EMA alpha (0-1) for hand keypoint smoothing.",
+    )
+    parser.add_argument(
+        "--hand-smooth-adaptive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable adaptive alpha to reduce lag during fast hand motion.",
+    )
+    parser.add_argument(
+        "--hand-smooth-fast-alpha",
+        type=float,
+        default=0.88,
+        help="Upper alpha bound used when hand motion is fast (0-1).",
+    )
+    parser.add_argument(
+        "--hand-smooth-motion-scale",
+        type=float,
+        default=0.12,
+        help="Motion ratio scale for adaptive alpha. Smaller means more responsive.",
+    )
+    parser.add_argument(
+        "--hand-hold-frames",
+        type=int,
+        default=2,
+        help="Keep previous hand for N missed frames to reduce flicker.",
+    )
+    parser.add_argument(
+        "--hand-side-merge-ratio",
+        type=float,
+        default=0.45,
+        help=(
+            "If left/right hand centers are too close, merge into one side "
+            "(distance <= ratio * min(diagonal))."
+        ),
+    )
+
     parser.add_argument(
         "--fps",
         type=float,
@@ -126,6 +173,7 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Output interval in seconds.",
     )
+
     parser.add_argument(
         "--keypoint-conf",
         type=float,
@@ -150,6 +198,70 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Minimum number of hand points required to confirm contact.",
     )
+
+    parser.add_argument(
+        "--det-include",
+        default=None,
+        help=(
+            "Comma-separated object class names to keep only (case-insensitive). "
+            "Example: cup,bottle. Empty keeps all classes."
+        ),
+    )
+    parser.add_argument(
+        "--det-exclude",
+        default="person,hand,left hand,right hand,left_hand,right_hand",
+        help=(
+            "Comma-separated class names to exclude (case-insensitive). "
+            "Default excludes person/hand classes."
+        ),
+    )
+
+    parser.add_argument(
+        "--obj-dedup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable object deduplication across full-frame and ROI detections.",
+    )
+    parser.add_argument(
+        "--obj-dedup-iou",
+        type=float,
+        default=0.45,
+        help="IoU threshold (0-1) for considering two same-class objects as duplicates.",
+    )
+    parser.add_argument(
+        "--obj-dedup-center-ratio",
+        type=float,
+        default=0.35,
+        help=(
+            "Center-distance ratio for dedup fallback (distance <= ratio * min(diagonal)). "
+            "Set 0 to disable this fallback."
+        ),
+    )
+    parser.add_argument(
+        "--obj-conflict-suppress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Suppress cross-class nested conflicts (whole object + part-of-object false class).",
+    )
+    parser.add_argument(
+        "--obj-conflict-overlap",
+        type=float,
+        default=0.75,
+        help="Min intersection-over-smaller-area (0-1) to treat two classes as conflicting.",
+    )
+    parser.add_argument(
+        "--obj-conflict-area-ratio",
+        type=float,
+        default=1.8,
+        help="Min larger/smaller area ratio for cross-class conflict suppression.",
+    )
+    parser.add_argument(
+        "--obj-conflict-score-gap",
+        type=float,
+        default=0.15,
+        help="If score gap exceeds this, keep higher score in cross-class conflict.",
+    )
+
     parser.add_argument(
         "--hand-roi-det",
         action=argparse.BooleanOptionalAction,
@@ -174,6 +286,88 @@ def parse_args() -> argparse.Namespace:
         help="Minimum hand ROI size in pixels (>=32).",
     )
     parser.add_argument(
+        "--hand-roi-min-size-ratio",
+        type=float,
+        default=0.12,
+        help="Minimum hand ROI size as frame short-side ratio (0-1).",
+    )
+    parser.add_argument(
+        "--hand-roi-context-scale",
+        type=float,
+        default=1.9,
+        help="Scale multiplier for an additional context ROI per hand.",
+    )
+    parser.add_argument(
+        "--hand-roi-forward-shift",
+        type=float,
+        default=0.42,
+        help="Shift context ROI along hand forward direction (relative to hand ROI size).",
+    )
+    parser.add_argument(
+        "--hand-roi-inward-scale",
+        type=float,
+        default=1.18,
+        help="Scale multiplier for an inward (toward wrist) compensation ROI per hand.",
+    )
+    parser.add_argument(
+        "--hand-roi-inward-shift",
+        type=float,
+        default=0.1,
+        help="Shift inward compensation ROI opposite to hand forward direction.",
+    )
+    parser.add_argument(
+        "--hand-roi-direction-smooth",
+        type=float,
+        default=0.35,
+        help="Smoothing factor (0-1) for ROI forward direction stabilization.",
+    )
+    parser.add_argument(
+        "--hand-roi-merge-iou",
+        type=float,
+        default=0.7,
+        help="IoU threshold to merge overlapping ROIs for each hand.",
+    )
+    parser.add_argument(
+        "--hand-roi-global-merge-iou",
+        type=float,
+        default=0.78,
+        help="IoU threshold to merge ROIs across both hands (suppresses duplicate ROIs).",
+    )
+    parser.add_argument(
+        "--hand-roi-cross-side-merge-ratio",
+        type=float,
+        default=0.45,
+        help=(
+            "If left/right ROI seeds are too close, collapse them as one hand "
+            "(distance <= ratio * min(size))."
+        ),
+    )
+    parser.add_argument(
+        "--hand-roi-hold-frames",
+        type=int,
+        default=2,
+        help="Keep previous ROI for N frames when keypoints are temporarily missing.",
+    )
+    parser.add_argument(
+        "--hand-roi-shrink-floor",
+        type=float,
+        default=0.9,
+        help="Per-frame minimum ROI size ratio vs previous frame (prevents sudden tiny ROI).",
+    )
+    parser.add_argument(
+        "--hand-roi-size-smooth",
+        type=float,
+        default=0.35,
+        help="Smoothing factor for ROI center/size (0-1). Higher means more responsive.",
+    )
+
+    parser.add_argument(
+        "--debug",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable all debug overlays (ROI boxes, counters, diagnostics).",
+    )
+    parser.add_argument(
         "--hand-roi-debug",
         action="store_true",
         help="Show hand ROI boxes in preview.",
@@ -193,16 +387,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable log file output (stdout still enabled).",
     )
+
     return parser.parse_args()
+
+
+def _parse_name_csv(value: str | None) -> tuple[str, ...]:
+    """将逗号分隔的类别名字符串解析为元组。"""
+    if value is None:
+        return tuple()
+    return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
 def main() -> int:
     """主程序入口。
 
-    返回:
-        int: 0 表示正常退出，非 0 表示异常退出。
+    返回：
+        int: 0 表示正常退出。
     """
     args = parse_args()
+    det_include_names = _parse_name_csv(args.det_include)
+    det_exclude_names = _parse_name_csv(args.det_exclude)
+
     source_arg = args.source if args.source is not None else default_source()
     source = coerce_source(source_arg)
 
@@ -210,6 +415,7 @@ def main() -> int:
     det_model_arg = prepare_model_arg(args.det_model)
     pose_model = load_pose_model(pose_model_arg)
     det_model = load_det_model(det_model_arg)
+
     hand_model_arg = Path(args.hand_model).expanduser()
     if not hand_model_arg.is_absolute():
         hand_model_arg = (project_root() / hand_model_arg).resolve()
@@ -226,7 +432,7 @@ def main() -> int:
     if not cap:
         raise RuntimeError(f"Unable to open webcam source: {source_arg}")
 
-    # 尝试设置摄像头采集帧率（部分设备可能会忽略该设置）
+    # 尝试设置采集帧率；部分设备可能忽略该设置。
     if args.fps and args.fps >= 1:
         cap.set(cv2.CAP_PROP_FPS, float(args.fps))
 
@@ -236,6 +442,7 @@ def main() -> int:
         min_frames=6,
         keypoint_conf=args.keypoint_conf,
     )
+
     emitters = [JsonlEmitter()]
     log_handle = None
     if not args.no_log:
@@ -249,9 +456,38 @@ def main() -> int:
         log_handle = log_path.open("w", encoding="utf-8")
         emitters.append(JsonlEmitter(log_handle))
 
+    show_preview = not args.no_preview
+    debug_all = bool(args.debug)
+    roi_debug = debug_all or args.hand_roi_debug
+
+    hand_stabilizer = HandStabilizer(
+        smooth_alpha=args.hand_smooth_alpha,
+        hold_frames=args.hand_hold_frames,
+        side_merge_ratio=args.hand_side_merge_ratio,
+        adaptive_alpha=args.hand_smooth_adaptive,
+        fast_alpha=args.hand_smooth_fast_alpha,
+        motion_scale=args.hand_smooth_motion_scale,
+    )
+    hand_roi_builder = HandRoiBuilder(
+        padding_ratio=args.hand_roi_padding,
+        min_size=args.hand_roi_min_size,
+        min_size_ratio=args.hand_roi_min_size_ratio,
+        context_scale=args.hand_roi_context_scale,
+        forward_shift=args.hand_roi_forward_shift,
+        inward_scale=args.hand_roi_inward_scale,
+        inward_shift=args.hand_roi_inward_shift,
+        direction_smooth=args.hand_roi_direction_smooth,
+        merge_iou=args.hand_roi_merge_iou,
+        hold_frames=args.hand_roi_hold_frames,
+        shrink_floor=args.hand_roi_shrink_floor,
+        size_smooth=args.hand_roi_size_smooth,
+        global_merge_iou=args.hand_roi_global_merge_iou,
+        cross_side_merge_ratio=args.hand_roi_cross_side_merge_ratio,
+    )
+
     last_emit = 0.0
     frame_index = 0
-    show_preview = not args.no_preview
+    prev_frame_ts = time.time()
 
     try:
         while True:
@@ -260,7 +496,7 @@ def main() -> int:
                 break
 
             now = time.time()
-            # 姿态推理：默认只保留置信度最高的单人结果
+            # 姿态推理：默认仅保留置信度最高的单人结果。
             pose_batch = infer_pose(
                 pose_model,
                 frame,
@@ -270,7 +506,8 @@ def main() -> int:
                 return_result=show_preview,
                 top_k=1,
             )
-            # 物体检测/分割推理
+
+            # 全图目标检测/分割；若 hand_roi_only 开启，则跳过全图检测。
             det_batch = None
             if not args.hand_roi_only:
                 det_batch = infer_objects(
@@ -279,27 +516,35 @@ def main() -> int:
                     conf=args.conf,
                     imgsz=args.imgsz,
                     device=args.device,
+                    include_names=det_include_names,
+                    exclude_names=det_exclude_names,
                     return_result=False,
                 )
 
-            # 追踪单人（当前默认 top-1），用于持续的动作识别
+            # 单人追踪：用于维持动作状态的时间连续性。
             persons = tracker.update(pose_batch.detections, now)
+
             actions: dict[int, ActionResult] = {}
             contacts: dict[int, ContactResult] = {}
             hand_points: dict[int, dict[str, list[tuple[float, float, float]] | None]] = {}
             roi_objects: list[DetectedObject] = []
             rois: list[tuple[int, int, int, int]] = []
+
             timestamp_ms = int(now * 1000)
             hands = detect_hands(hand_landmarker, frame, timestamp_ms)
-            hands_lr = to_left_right_map(hands)
+            if args.hand_stabilize:
+                hands_lr = hand_stabilizer.update(hands, frame_shape=frame.shape[:2])
+            else:
+                hands_lr = to_left_right_map(hands)
+
+            if hands and hands_lr.get("left") is None and hands_lr.get("right") is None:
+                # 兜底策略：稳定器短时给空时，回退到原始 left/right 映射。
+                hands_lr = to_left_right_map(hands)
+
             use_roi_det = args.hand_roi_det or args.hand_roi_only
-            if use_roi_det and hands:
-                rois = _build_hand_rois(
-                    hands_lr,
-                    frame.shape[:2],
-                    padding_ratio=args.hand_roi_padding,
-                    min_size=args.hand_roi_min_size,
-                )
+            has_hand_roi_seed = hands_lr.get("left") is not None or hands_lr.get("right") is not None
+            if use_roi_det and has_hand_roi_seed:
+                rois = hand_roi_builder.build(hands_lr, frame.shape[:2])
                 roi_objects = _infer_objects_on_rois(
                     det_model,
                     frame,
@@ -307,17 +552,29 @@ def main() -> int:
                     conf=args.conf,
                     imgsz=args.imgsz,
                     device=args.device,
+                    include_names=det_include_names,
+                    exclude_names=det_exclude_names,
                 )
 
-            if args.hand_roi_only:
-                objects_for_contact = roi_objects
-            else:
-                objects_for_contact = (det_batch.objects if det_batch else []) + roi_objects
+            full_frame_objects = det_batch.objects if det_batch else []
+            all_objects = roi_objects if args.hand_roi_only else (full_frame_objects + roi_objects)
+            raw_object_count = len(all_objects)
+
+            if args.obj_dedup:
+                all_objects = deduplicate_objects(
+                    all_objects,
+                    iou_threshold=args.obj_dedup_iou,
+                    center_ratio=args.obj_dedup_center_ratio,
+                    conflict_suppress=args.obj_conflict_suppress,
+                    conflict_overlap=args.obj_conflict_overlap,
+                    conflict_area_ratio=args.obj_conflict_area_ratio,
+                    conflict_score_gap=args.obj_conflict_score_gap,
+                )
+            objects_for_contact = all_objects
 
             for person in persons:
-                # MediaPipe 已内置检测 + 追踪裁剪策略，直接使用全帧检测结果
+                # 当前默认单人场景，直接复用全帧手结果到当前 track。
                 hand_points[person.track_id] = hands_lr
-                # 归一化关键点，便于动作规则处理
                 normalized = normalize_keypoints(person.keypoints, args.keypoint_conf)
                 action_engine.update(person.track_id, normalized, now)
                 actions[person.track_id] = action_engine.classify(person.track_id)
@@ -331,13 +588,13 @@ def main() -> int:
                     min_points=args.contact_min_points,
                 )
 
-            # 结果输出节流：interval <= 0 表示每帧输出
+            # 输出节流：interval <= 0 表示每帧输出。
             if args.interval <= 0:
                 should_emit = True
             else:
                 should_emit = (now - last_emit) >= args.interval
 
-            # 仅当存在检测到的人时输出记录
+            # 仅当存在人体时输出记录，避免空帧刷日志。
             if should_emit and persons:
                 records = [
                     _build_record(
@@ -354,25 +611,43 @@ def main() -> int:
                     emitter.emit_many(records)
                 last_emit = now
 
-            # 可视化预览
+            # 可视化预览：叠加姿态、目标、手关键点和调试信息。
             if show_preview:
                 annotated = frame
                 if pose_batch.result is not None:
                     annotated = pose_batch.result.plot()
-                if args.hand_roi_debug and rois:
+                if roi_debug and rois:
                     _draw_rois(annotated, rois, color=(255, 128, 0))
                 _draw_overlay(
                     annotated,
                     persons,
                     actions,
                     contacts,
-                    (det_batch.objects if det_batch else []) + roi_objects,
+                    objects_for_contact,
                     hand_points,
+                    global_hands=hands_lr,
                 )
+                if debug_all:
+                    dt = max(1e-6, now - prev_frame_ts)
+                    _draw_debug_lines(
+                        annotated,
+                        lines=[
+                            f"fps:{1.0 / dt:.1f}",
+                            f"obj raw:{raw_object_count} final:{len(objects_for_contact)}",
+                            (
+                                "hands raw:"
+                                f"{len(hands)} "
+                                f"lr:{int(hands_lr.get('left') is not None)}/"
+                                f"{int(hands_lr.get('right') is not None)}"
+                            ),
+                            f"rois:{len(rois)}",
+                        ],
+                    )
                 cv2.imshow("Action + Contact", annotated)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
+            prev_frame_ts = now
             frame_index += 1
 
     except KeyboardInterrupt:
@@ -396,19 +671,7 @@ def _build_record(
     contact: ContactResult | None,
     hands: dict[str, list[tuple[float, float, float]] | None] | None,
 ) -> dict:
-    """构建输出记录（JSONL 字典）。
-
-    参数:
-        timestamp: 当前时间戳（秒）。
-        frame_index: 帧序号（从 0 开始）。
-        person: 追踪到的人员信息。
-        action: 动作识别结果（可为 None）。
-        contact: 接触检测结果（可为 None）。
-        hands: 手部关键点（左右手，可能为 None）。
-
-    返回:
-        dict: 结构化输出记录。
-    """
+    """构建单条结构化输出记录（用于 stdout/JSONL）。"""
     action = action or ActionResult(action="none", confidence=0.0)
     contact = contact or ContactResult(
         active=False,
@@ -439,17 +702,9 @@ def _draw_overlay(
     contacts: dict[int, ContactResult],
     objects,
     hands: dict[int, dict[str, list[tuple[float, float, float]] | None]],
+    global_hands: dict[str, list[tuple[float, float, float]] | None] | None = None,
 ) -> None:
-    """在画面上绘制检测框、动作与接触标记。
-
-    参数:
-        frame: 当前图像帧（OpenCV BGR）。
-        persons: 追踪到的人员列表。
-        actions: track_id -> 动作识别结果。
-        contacts: track_id -> 接触检测结果。
-        objects: 物体检测结果列表。
-        hands: track_id -> 左右手关键点。
-    """
+    """在预览画面绘制目标框、动作标签、接触结果与手关键点。"""
     for obj_idx, obj in enumerate(objects):
         x1, y1, x2, y2 = [int(v) for v in obj.bbox]
         if obj.mask is not None:
@@ -486,10 +741,27 @@ def _draw_overlay(
             font_scale=0.6,
             thickness=2,
         )
-        hand_data = hands.get(person.track_id)
+
+    # 手关键点绘制与人体框解耦：即使姿态框短时不稳定也尽量保持可见。
+    if global_hands:
+        drew = False
+        left_kps = global_hands.get("left")
+        right_kps = global_hands.get("right")
+        if left_kps:
+            _draw_hand_keypoints(frame, left_kps, color=(0, 128, 255))
+            drew = True
+        if right_kps:
+            _draw_hand_keypoints(frame, right_kps, color=(0, 255, 128))
+            drew = True
+        if drew:
+            return
+
+    # 兼容回退：若 global_hands 为空，则从按人缓存中取一份手数据绘制。
+    for hand_data in hands.values():
         if hand_data:
             _draw_hand_keypoints(frame, hand_data.get("left"), color=(0, 128, 255))
             _draw_hand_keypoints(frame, hand_data.get("right"), color=(0, 255, 128))
+            break
 
 
 def _draw_label(
@@ -502,18 +774,7 @@ def _draw_label(
     font_scale: float,
     thickness: int,
 ) -> None:
-    """绘制带背景色的文本标签。
-
-    参数:
-        frame: OpenCV 图像帧（BGR）。
-        text: 文本内容。
-        x: 文本左上角 X 坐标（像素）。
-        y: 文本基线 Y 坐标（像素）。
-        text_color: 字体颜色（B, G, R）。
-        bg_color: 背景色（B, G, R）。
-        font_scale: 字体缩放比例（>0）。
-        thickness: 字体线宽（>=1）。
-    """
+    """绘制带背景底色的文本标签，避免复杂背景下文字难以辨认。"""
     font = cv2.FONT_HERSHEY_SIMPLEX
     (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
     height, width = frame.shape[:2]
@@ -525,20 +786,36 @@ def _draw_label(
     cv2.putText(frame, text, (x + 2, y), font, font_scale, text_color, thickness)
 
 
+def _draw_debug_lines(
+    frame,
+    lines: list[str],
+) -> None:
+    """在左上角绘制紧凑调试面板（FPS、目标数、ROI 数等）。"""
+    if not lines:
+        return
+    x = 10
+    y = 22
+    for line in lines:
+        _draw_label(
+            frame,
+            line,
+            x,
+            y,
+            text_color=(20, 20, 20),
+            bg_color=(210, 255, 210),
+            font_scale=0.5,
+            thickness=1,
+        )
+        y += 18
+
+
 def _draw_mask_edges(
     frame,
     mask,
     color: tuple[int, int, int],
     thickness: int = 2,
 ) -> None:
-    """绘制分割 mask 的边缘轮廓。
-
-    参数:
-        frame: OpenCV 图像帧（BGR）。
-        mask: 二值或概率 mask（H, W）。
-        color: 边缘颜色（B, G, R）。
-        thickness: 线宽（>=1）。
-    """
+    """绘制分割掩码的轮廓线，用于直观显示分割边界。"""
     mask_uint8 = (mask > 0.5).astype("uint8") * 255
     contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
@@ -549,16 +826,9 @@ def _draw_hand_keypoints(
     frame,
     keypoints: list[tuple[float, float, float]] | None,
     color: tuple[int, int, int],
-    conf_threshold: float = 0.1,
+    conf_threshold: float = 0.0,
 ) -> None:
-    """绘制手部关键点与连线。
-
-    参数:
-        frame: OpenCV 图像帧（BGR）。
-        keypoints: 手部关键点列表（21 点）。
-        color: 绘制颜色（B, G, R）。
-        conf_threshold: 绘制阈值（0-1），小于该值不画点。
-    """
+    """绘制手关键点和骨架连线。"""
     if not keypoints:
         return
     for i, j in HAND_EDGES:
@@ -573,49 +843,6 @@ def _draw_hand_keypoints(
             cv2.circle(frame, (int(x), int(y)), 2, color, -1)
 
 
-def _build_hand_rois(
-    hands_lr: dict[str, list[tuple[float, float, float]] | None],
-    frame_shape: tuple[int, int],
-    padding_ratio: float,
-    min_size: int,
-) -> list[tuple[int, int, int, int]]:
-    """根据手部关键点构建 ROI 列表。
-
-    参数:
-        hands_lr: {"left": kps|None, "right": kps|None}。
-        frame_shape: (H, W)。
-        padding_ratio: 基于手框尺寸的扩张比例。
-        min_size: ROI 最小像素尺寸。
-
-    返回:
-        list: ROI 列表，每项为 (x1, y1, x2, y2)。
-    """
-    h, w = frame_shape
-    rois: list[tuple[int, int, int, int]] = []
-    for side in ("left", "right"):
-        kps = hands_lr.get(side)
-        if not kps:
-            continue
-        xs = [x for x, _, _ in kps]
-        ys = [y for _, y, _ in kps]
-        x1, x2 = min(xs), max(xs)
-        y1, y2 = min(ys), max(ys)
-        box_w = max(1.0, x2 - x1)
-        box_h = max(1.0, y2 - y1)
-        pad = max(box_w, box_h) * max(0.0, min(padding_ratio, 1.0))
-        cx = (x1 + x2) / 2.0
-        cy = (y1 + y2) / 2.0
-        size = max(min_size, int(max(box_w, box_h) + pad * 2))
-        half = size // 2
-        rx1 = int(max(0, min(w - 1, cx - half)))
-        ry1 = int(max(0, min(h - 1, cy - half)))
-        rx2 = int(max(0, min(w, cx + half)))
-        ry2 = int(max(0, min(h, cy + half)))
-        if rx2 - rx1 >= 2 and ry2 - ry1 >= 2:
-            rois.append((rx1, ry1, rx2, ry2))
-    return rois
-
-
 def _infer_objects_on_rois(
     det_model,
     frame: np.ndarray,
@@ -623,20 +850,10 @@ def _infer_objects_on_rois(
     conf: float,
     imgsz: int,
     device: str | None,
+    include_names: tuple[str, ...],
+    exclude_names: tuple[str, ...],
 ) -> list[DetectedObject]:
-    """在多个 ROI 上运行检测，并映射回原图坐标。
-
-    参数:
-        det_model: 已加载的检测/分割模型。
-        frame: 原始图像帧（BGR）。
-        rois: ROI 列表。
-        conf: 置信度阈值。
-        imgsz: 推理尺寸。
-        device: 推理设备。
-
-    返回:
-        list[DetectedObject]: 合并后的检测结果。
-    """
+    """在多个 ROI 上执行检测，并将结果映射回原图坐标系。"""
     results: list[DetectedObject] = []
     h, w = frame.shape[:2]
     for roi in rois:
@@ -650,8 +867,8 @@ def _infer_objects_on_rois(
             conf=conf,
             imgsz=imgsz,
             device=device,
-            # ROI 检测仅关注手上小物体，避免把“人/手”当作物体画出大面积 mask
-            exclude_names=("person",),
+            include_names=include_names,
+            exclude_names=exclude_names,
             return_result=False,
         )
         for obj in batch.objects:
@@ -659,12 +876,12 @@ def _infer_objects_on_rois(
             mapped_bbox = (bx1 + x1, by1 + y1, bx2 + x1, by2 + y1)
             mapped_mask = None
             if obj.mask is not None:
-                # 将 ROI mask 映射回全图
+                # 将 ROI 内的掩码映射回整帧坐标，便于统一后处理。
                 mask_full = np.zeros((h, w), dtype=obj.mask.dtype)
                 roi_h = y2 - y1
                 roi_w = x2 - x1
                 mask = obj.mask
-                # 关键修正：若 mask 尺寸与 ROI 不一致，则先 resize 到 ROI 大小
+                # 若模型输出掩码尺寸与 ROI 尺寸不一致，先 resize 再回贴。
                 if mask.shape[:2] != (roi_h, roi_w):
                     mask = cv2.resize(mask, (roi_w, roi_h), interpolation=cv2.INTER_NEAREST)
                 rx2 = min(x1 + roi_w, w)
@@ -687,7 +904,7 @@ def _draw_rois(
     rois: list[tuple[int, int, int, int]],
     color: tuple[int, int, int],
 ) -> None:
-    """绘制 ROI 区域（调试用）。"""
+    """绘制 ROI 矩形（调试用途）。"""
     for x1, y1, x2, y2 in rois:
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
 
@@ -695,7 +912,7 @@ def _draw_rois(
 def _serialize_hands(
     hands: dict[str, list[tuple[float, float, float]] | None] | None,
 ) -> dict[str, list[dict] | None] | None:
-    """将手部关键点转换为可 JSON 化的结构。"""
+    """将手关键点转换为可 JSON 序列化的数据结构。"""
     if hands is None:
         return None
     output: dict[str, list[dict] | None] = {}
