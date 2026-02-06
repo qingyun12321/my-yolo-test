@@ -33,7 +33,9 @@ from .features.skeleton import normalize_keypoints
 from .io.capture import open_capture
 from .io.output import JsonlEmitter
 from .postprocess.object_filter import deduplicate_objects
+from .postprocess.object_temporal import ObjectTemporalStabilizer
 from .types import ActionResult, ContactResult, DetectedObject, TrackedPerson
+from .vision.class_whitelist import load_whitelist_from_config
 from .vision.detect import infer_objects, load_det_model
 from .vision.hand_mediapipe import (
     create_hand_landmarker,
@@ -215,6 +217,31 @@ def parse_args() -> argparse.Namespace:
             "Default excludes person/hand classes."
         ),
     )
+    parser.add_argument(
+        "--det-whitelist-config",
+        default=None,
+        help=(
+            "YAML config path to load whitelist classes (usually your segmentation data yaml). "
+            "Supports direct `names` or train yaml with `data: xxx.yaml`."
+        ),
+    )
+    parser.add_argument(
+        "--det-whitelist-field",
+        default="names",
+        help=(
+            "Field path for whitelist classes inside YAML (default: names). "
+            "Supports dotted path, e.g. data.names."
+        ),
+    )
+    parser.add_argument(
+        "--det-whitelist-mode",
+        choices=("override", "union"),
+        default="override",
+        help=(
+            "How to combine --det-include with config whitelist: "
+            "override (use config only) or union (merge both)."
+        ),
+    )
 
     parser.add_argument(
         "--obj-dedup",
@@ -260,6 +287,57 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.15,
         help="If score gap exceeds this, keep higher score in cross-class conflict.",
+    )
+    parser.add_argument(
+        "--obj-temporal",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable temporal stabilizer for detected objects.",
+    )
+    parser.add_argument(
+        "--obj-temporal-hold-frames",
+        type=int,
+        default=3,
+        help="Keep objects for N frames when temporarily occluded/missed.",
+    )
+    parser.add_argument(
+        "--obj-temporal-min-hits",
+        type=int,
+        default=1,
+        help="Minimum matched frames before an object is emitted.",
+    )
+    parser.add_argument(
+        "--obj-temporal-iou",
+        type=float,
+        default=0.32,
+        help="Minimum IoU to match object tracks across frames.",
+    )
+    parser.add_argument(
+        "--obj-temporal-center-ratio",
+        type=float,
+        default=0.72,
+        help=(
+            "Fallback center-distance ratio for temporal match "
+            "(distance <= ratio * min(diagonal))."
+        ),
+    )
+    parser.add_argument(
+        "--obj-temporal-bbox-alpha",
+        type=float,
+        default=0.62,
+        help="EMA alpha (0-1) for temporal bbox/score smoothing.",
+    )
+    parser.add_argument(
+        "--obj-temporal-class-decay",
+        type=float,
+        default=0.9,
+        help="Decay factor (0-1) for class voting history in temporal tracks.",
+    )
+    parser.add_argument(
+        "--obj-temporal-score-decay",
+        type=float,
+        default=0.9,
+        help="Per-frame score decay (0-1) for held tracks when missed.",
     )
 
     parser.add_argument(
@@ -398,6 +476,22 @@ def _parse_name_csv(value: str | None) -> tuple[str, ...]:
     return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
+def _merge_name_tuples(
+    primary: tuple[str, ...],
+    secondary: tuple[str, ...],
+) -> tuple[str, ...]:
+    """合并两组类别名并按大小写不敏感去重。"""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for name in (*primary, *secondary):
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(name)
+    return tuple(merged)
+
+
 def main() -> int:
     """主程序入口。
 
@@ -407,6 +501,25 @@ def main() -> int:
     args = parse_args()
     det_include_names = _parse_name_csv(args.det_include)
     det_exclude_names = _parse_name_csv(args.det_exclude)
+
+    if args.det_whitelist_config:
+        whitelist_path = Path(args.det_whitelist_config).expanduser()
+        if not whitelist_path.is_absolute():
+            whitelist_path = (project_root() / whitelist_path).resolve()
+
+        whitelist_names = load_whitelist_from_config(
+            whitelist_path,
+            field_path=args.det_whitelist_field,
+        )
+        if args.det_whitelist_mode == "union":
+            det_include_names = _merge_name_tuples(det_include_names, whitelist_names)
+        else:
+            det_include_names = whitelist_names
+        if not det_include_names:
+            raise RuntimeError(
+                "det whitelist config 已加载，但解析结果为空。"
+                f" path={whitelist_path}, field={args.det_whitelist_field}"
+            )
 
     source_arg = args.source if args.source is not None else default_source()
     source = coerce_source(source_arg)
@@ -484,6 +597,20 @@ def main() -> int:
         global_merge_iou=args.hand_roi_global_merge_iou,
         cross_side_merge_ratio=args.hand_roi_cross_side_merge_ratio,
     )
+    object_temporal = None
+    if args.obj_temporal:
+        object_temporal = ObjectTemporalStabilizer(
+            hold_frames=args.obj_temporal_hold_frames,
+            min_hits=args.obj_temporal_min_hits,
+            match_iou=args.obj_temporal_iou,
+            match_center_ratio=args.obj_temporal_center_ratio,
+            bbox_alpha=args.obj_temporal_bbox_alpha,
+            class_decay=args.obj_temporal_class_decay,
+            score_decay=args.obj_temporal_score_decay,
+        )
+
+    if det_include_names:
+        print("Detection include classes:", ", ".join(det_include_names))
 
     last_emit = 0.0
     frame_index = 0
@@ -559,6 +686,7 @@ def main() -> int:
             full_frame_objects = det_batch.objects if det_batch else []
             all_objects = roi_objects if args.hand_roi_only else (full_frame_objects + roi_objects)
             raw_object_count = len(all_objects)
+            dedup_object_count = raw_object_count
 
             if args.obj_dedup:
                 all_objects = deduplicate_objects(
@@ -570,7 +698,12 @@ def main() -> int:
                     conflict_area_ratio=args.obj_conflict_area_ratio,
                     conflict_score_gap=args.obj_conflict_score_gap,
                 )
-            objects_for_contact = all_objects
+            dedup_object_count = len(all_objects)
+
+            if object_temporal is not None:
+                objects_for_contact = object_temporal.update(all_objects)
+            else:
+                objects_for_contact = all_objects
 
             for person in persons:
                 # 当前默认单人场景，直接复用全帧手结果到当前 track。
@@ -633,7 +766,12 @@ def main() -> int:
                         annotated,
                         lines=[
                             f"fps:{1.0 / dt:.1f}",
-                            f"obj raw:{raw_object_count} final:{len(objects_for_contact)}",
+                            (
+                                "obj raw:"
+                                f"{raw_object_count} "
+                                f"dedup:{dedup_object_count} "
+                                f"temporal:{len(objects_for_contact)}"
+                            ),
                             (
                                 "hands raw:"
                                 f"{len(hands)} "

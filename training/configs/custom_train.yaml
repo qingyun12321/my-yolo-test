@@ -1,0 +1,29 @@
+# Ultralytics 训练覆盖配置模板（可选）
+# 使用方式：
+# 1) 根据需要修改参数；
+# 2) 训练时通过 `--cfg training/configs/custom_train.yaml` 注入；
+# 3) 再用 `--override key=value` 做临时覆盖。
+
+# 基础训练参数
+epochs: 100
+imgsz: 640
+batch: 8
+workers: 8
+
+# 优化与学习率
+optimizer: auto
+lr0: 0.01
+lrf: 0.01
+weight_decay: 0.0005
+
+# 数据增强（按业务微调）
+mosaic: 0.2
+mixup: 0.0
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+
+# 早停与保存
+patience: 100
+save: true
+save_period: -1

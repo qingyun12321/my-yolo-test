@@ -1,0 +1,19 @@
+# 目标分割训练数据配置（Ultralytics YOLO 格式）
+# 使用方式：
+# 1) 修改 path/train/val(/test) 指向你的真实数据目录；
+# 2) 修改 names 为你的业务白名单类别；
+# 3) 训练与推理都复用该文件，避免类别列表不一致。
+
+# 数据集根目录
+path: datasets/your-seg-dataset
+
+# 以下路径相对于 path
+train: images/train
+val: images/val
+test: images/test
+
+# 类别定义：支持 list 或 dict，这里使用 dict 写法更直观
+names:
+  0: cup
+  1: bottle
+  2: screwdriver
